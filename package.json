@@ -1,0 +1,25 @@
+{
+  "name": "medical-image-finder-mobile",
+  "version": "1.0.0",
+  "description": "Mobile-ready (iPadOS & Android) medical image finder for Obsidian using DuckDuckGo, AI Visual Scanner, Fast Batch Review, and point-level insertion.",
+  "main": "main.js",
+  "scripts": {
+    "test": "node --test tests/*.test.cjs",
+    "check": "node --check main.js"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "mobile",
+    "ipad",
+    "android",
+    "medical",
+    "images",
+    "diagrams",
+    "anatomy",
+    "radiology",
+    "histology"
+  ],
+  "author": "Ayush4265",
+  "license": "MIT"
+}

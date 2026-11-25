@@ -1,0 +1,8 @@
+node_modules/
+.DS_Store
+Thumbs.db
+data.json
+*.log
+__pycache__/
+upload-to-github.py
+upload-to-github.bat

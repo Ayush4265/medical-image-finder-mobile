@@ -1,0 +1,10 @@
+{
+  "id": "medical-image-finder-mobile",
+  "name": "Medical Image Finder Mobile",
+  "version": "1.0.0",
+  "minAppVersion": "1.5.0",
+  "description": "Mobile-ready (iPadOS & Android) medical image finder using DuckDuckGo, AI Visual Scanner, Fast Batch Review, and point-level note insertion.",
+  "author": "Ayush4265",
+  "authorUrl": "https://github.com/Ayush4265",
+  "isDesktopOnly": false
+}
