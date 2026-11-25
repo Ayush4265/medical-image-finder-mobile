@@ -17,10 +17,14 @@ const {
 const VIEW_TYPE_MIFM = "medical-image-finder-mobile-view";
 
 const DEFAULT_SETTINGS = {
+  defaultProvider: "duckduckgo",
   defaultFilterMode: "all",
   attachmentFolder: "Attachments/MedicalImages",
   defaultImageWidth: 500,
   includeCaption: false,
+  brightDataApiKey: "",
+  brightDataZone: "serp_api1",
+  braveApiKey: "",
   geminiMaxSuggestions: 25,
   aiBackend: "gemini",
   geminiApiKey: "",
@@ -30,6 +34,13 @@ const DEFAULT_SETTINGS = {
   lastScanResults: null,
   lastScannedNote: ""
 };
+
+const SEARCH_PROVIDERS = [
+  { id: "duckduckgo", label: "DuckDuckGo (Free / No Key)", shortLabel: "DUCKDUCKGO" },
+  { id: "brightdata", label: "Bright Data Google Images (5,000 Free/Mo)", shortLabel: "BRIGHT DATA" },
+  { id: "brave", label: "Brave Images (API Key)", shortLabel: "BRAVE" },
+  { id: "wikimedia", label: "Wikimedia Commons (Free)", shortLabel: "WIKIMEDIA" }
+];
 
 const MEDICAL_VISUAL_FILTERS = [
   { id: "all",        label: "All",                 modifier: "",                    skipIf: null },
@@ -292,8 +303,10 @@ function bindImageFallback(img, fallbackUrl) {
 
 const knownSecrets = new Set();
 function rememberSecrets(settings) {
-  if (typeof settings?.geminiApiKey === "string" && settings.geminiApiKey.trim()) {
-    knownSecrets.add(settings.geminiApiKey.trim());
+  for (const key of ["brightDataApiKey", "braveApiKey", "geminiApiKey"]) {
+    if (typeof settings?.[key] === "string" && settings[key].trim()) {
+      knownSecrets.add(settings[key].trim());
+    }
   }
 }
 
@@ -302,7 +315,8 @@ function safeError(error) {
   for (const secret of knownSecrets) message = message.split(secret).join("[redacted]");
   return message
     .replace(/https?:\/\/[^\s<>"']+/gi, "[request URL]")
-    .replace(/((?:api[_-]?key|key|token)\s*[=:]\s*)[^\s&,]+/gi, "$1[redacted]")
+    .replace(/((?:api[_-]?key|key|token|authorization)\s*[=:]\s*(?:bearer\s+)?)[^\s&,]+/gi, "$1[redacted]")
+    .replace(/\bBearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]")
     .replace(/AIza[\w-]+/g, "[redacted]");
 }
 
@@ -320,8 +334,16 @@ function attachmentPath(value) {
 
 function normalizeSettings(saved) {
   const settings = { ...DEFAULT_SETTINGS, ...(saved && typeof saved === "object" ? saved : {}) };
+  if (!["duckduckgo", "brightdata", "brave", "wikimedia"].includes(settings.defaultProvider)) {
+    settings.defaultProvider = "duckduckgo";
+  }
   if (!MEDICAL_VISUAL_FILTERS.some((f) => f.id === settings.defaultFilterMode)) settings.defaultFilterMode = "all";
   if (!["gemini", "offline"].includes(settings.aiBackend)) settings.aiBackend = "gemini";
+  settings.brightDataApiKey = typeof settings.brightDataApiKey === "string" ? settings.brightDataApiKey.trim() : "";
+  settings.brightDataZone = typeof settings.brightDataZone === "string" && settings.brightDataZone.trim()
+    ? settings.brightDataZone.trim()
+    : DEFAULT_SETTINGS.brightDataZone;
+  settings.braveApiKey = typeof settings.braveApiKey === "string" ? settings.braveApiKey.trim() : "";
   settings.geminiApiKey = typeof settings.geminiApiKey === "string" ? settings.geminiApiKey.trim() : "";
   settings.geminiModel = typeof settings.geminiModel === "string" && settings.geminiModel.trim()
     ? settings.geminiModel.trim()
@@ -453,9 +475,23 @@ function decodeHtmlEntities(str) {
 const REQUEST_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 25000;
+
+async function requestWithTimeout(options, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
+  let timerId = null;
+  try {
+    const timeout = new Promise((_, reject) => {
+      timerId = setTimeout(() => reject(new Error("Request timed out.")), timeoutMs);
+    });
+    return await Promise.race([requestUrl(options), timeout]);
+  } finally {
+    if (timerId) clearTimeout(timerId);
+  }
+}
+
 async function fetchText(url, headers = {}) {
   try {
-    const res = await requestUrl({
+    const res = await requestWithTimeout({
       url,
       headers: {
         "User-Agent": REQUEST_UA,
@@ -471,7 +507,7 @@ async function fetchText(url, headers = {}) {
 
 async function fetchJson(url, headers = {}) {
   try {
-    const res = await requestUrl({
+    const res = await requestWithTimeout({
       url,
       headers: {
         "User-Agent": REQUEST_UA,
@@ -481,7 +517,13 @@ async function fetchJson(url, headers = {}) {
     });
     const data = res.json;
     if (!data || typeof data !== "object") throw new Error("Unexpected API response.");
-    if (data.error) throw new Error(typeof data.error === "string" ? data.error : data.error.message || "Provider rejected request.");
+    if (data.error) {
+      throw new Error(
+        typeof data.error === "string"
+          ? data.error
+          : data.error.message || data.error.detail || "Provider rejected request."
+      );
+    }
     return data;
   } catch (err) {
     throw new Error(`API request failed: ${safeError(err)}`);
@@ -490,7 +532,7 @@ async function fetchJson(url, headers = {}) {
 
 async function fetchBinary(url, headers = {}) {
   try {
-    const res = await requestUrl({
+    const res = await requestWithTimeout({
       url,
       headers: {
         "User-Agent": REQUEST_UA,
@@ -506,12 +548,12 @@ async function fetchBinary(url, headers = {}) {
 }
 
 // -------------------------------------------------------------
-// Zero-Key Search Providers (DuckDuckGo Primary + Silent Wikimedia Fallback)
+// Image Search Providers (DuckDuckGo, Wikimedia, Brave, Bright Data)
 // -------------------------------------------------------------
 
 class WikimediaProvider {
   constructor() {
-    this.name = "Wikimedia Commons (Fallback)";
+    this.name = "Wikimedia Commons (Free)";
   }
 
   async search(query) {
@@ -557,7 +599,7 @@ class WikimediaProvider {
 
 class DuckDuckGoProvider {
   constructor() {
-    this.name = "DuckDuckGo";
+    this.name = "DuckDuckGo (Free / No Key)";
   }
 
   static extractVqd(html) {
@@ -577,7 +619,7 @@ class DuckDuckGoProvider {
   }
 
   async search(query) {
-    this.name = "DuckDuckGo";
+    this.name = "DuckDuckGo (Free / No Key)";
     try {
       return await this.searchPrimary(query);
     } catch (_) {
@@ -633,6 +675,331 @@ class DuckDuckGoProvider {
     this.name = "Wikimedia Commons (DuckDuckGo fallback)";
     const wikiProvider = new WikimediaProvider();
     return await wikiProvider.search(q);
+  }
+}
+
+class BraveProvider {
+  constructor(apiKey) {
+    this.name = "Brave Images";
+    this.apiKey = (apiKey || "").trim();
+  }
+
+  async search(query, retryDelayMs = 1100) {
+    if (!query || !query.trim()) return [];
+    if (!this.apiKey) {
+      throw new Error("Brave Image Search requires an API Key. Please enter it in plugin settings.");
+    }
+    const q = query.trim();
+    const url = `https://api.search.brave.com/res/v1/images/search?q=${encodeURIComponent(
+      q
+    )}&count=24&search_lang=en&country=ALL&spellcheck=false&safesearch=off`;
+
+    let data;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        data = await fetchJson(url, {
+          "X-Subscription-Token": this.apiKey
+        });
+        break;
+      } catch (err) {
+        const msg = String(err?.message || "");
+        if (attempt === 0 && /\b429\b/.test(msg)) {
+          await new Promise((r) => setTimeout(r, retryDelayMs));
+          continue;
+        }
+        if (/\b(?:401|403|422)\b/.test(msg)) {
+          throw new Error("Brave API authentication failed. Check your Brave API Key in Settings.");
+        }
+        throw err;
+      }
+    }
+
+    if (!data || !Array.isArray(data.results)) throw new Error("Unexpected Brave response.");
+
+    return data.results.slice(0, 24).map((item) => {
+      let domain = "";
+      try {
+        domain = new URL(item.url).hostname;
+      } catch (_) {}
+      return {
+        title: decodeHtmlEntities(item.title) || "Brave Image result",
+        imageUrl: item.properties?.url || item.thumbnail?.src,
+        thumbnailUrl: item.thumbnail?.src || item.properties?.url,
+        sourceUrl: item.url,
+        width: item.properties?.width || item.thumbnail?.width || null,
+        height: item.properties?.height || item.thumbnail?.height || null,
+        domain: domain.replace(/^www\./, "")
+      };
+    });
+  }
+}
+
+class BrightDataProvider {
+  constructor(apiKey, zone = "serp_api1") {
+    this.name = "Google Images via Bright Data";
+    this.apiKey = (apiKey || "").trim();
+    this.zone = (zone || "serp_api1").trim() || "serp_api1";
+  }
+
+  async search(query) {
+    if (!query || !query.trim()) return [];
+    if (!this.apiKey) {
+      throw new Error(
+        "Bright Data requires an API Key. Please enter it in plugin settings (Free 5,000 records/month)."
+      );
+    }
+    const q = query.trim();
+    const targetUrl = `https://www.google.com/search?q=${encodeURIComponent(q)}&tbm=isch&udm=2`;
+
+    const unwrapSourceLink = (rawLink) => {
+      if (!rawLink || typeof rawLink !== "string") return "";
+      try {
+        const u = new URL(rawLink, "https://www.google.com");
+        if (u.hostname.includes("google.") && u.pathname === "/url") {
+          const target = u.searchParams.get("q") || u.searchParams.get("url") || "";
+          const valid = httpUrl(target);
+          if (valid) return valid;
+        }
+      } catch (_) {}
+      return httpUrl(rawLink) || rawLink;
+    };
+
+    try {
+      const resp = await requestWithTimeout({
+        url: "https://api.brightdata.com/request",
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          zone: this.zone,
+          url: targetUrl,
+          format: "json"
+        })
+      });
+
+      const status = resp?.status;
+      if (status === 401 || status === 403) {
+        throw new Error(`Bright Data authentication failed (HTTP ${status}). Check your API Key and Zone.`);
+      }
+      if (status != null && status !== 200) {
+        throw new Error(`Bright Data SERP HTTP ${status}`);
+      }
+
+      let data = typeof resp.json === "object" && resp.json !== null ? resp.json : null;
+      if (!data && typeof resp.text === "string") {
+        try {
+          data = JSON.parse(resp.text);
+        } catch (_) {}
+      }
+
+      let rawBodyString = "";
+      if (data && data.body) {
+        if (typeof data.body === "string") {
+          rawBodyString = data.body;
+          try {
+            data = JSON.parse(data.body);
+          } catch (_) {}
+        } else if (typeof data.body === "object" && data.body !== null) {
+          data = data.body;
+        }
+      }
+
+      if (data && data.error) {
+        const errMsg = typeof data.error === "string" ? data.error : data.error.message || JSON.stringify(data.error);
+        throw new Error(`Bright Data error: ${errMsg}`);
+      }
+      if (data && data.message && !data.images && !data.images_results && !data.organic) {
+        throw new Error(`Bright Data message: ${data.message}`);
+      }
+
+      if (data && Array.isArray(data.images) && data.images.length > 0) {
+        return data.images.slice(0, 30).map((item) => {
+          const cleanSource = unwrapSourceLink(item.link);
+          let domain = "";
+          try {
+            if (item.original_image) domain = new URL(item.original_image).hostname;
+            else if (cleanSource) domain = new URL(cleanSource).hostname;
+          } catch (_) {}
+          if (domain.includes("google.") && item.title) {
+            domain = item.title;
+          } else if (!domain && item.title) {
+            domain = item.title;
+          }
+          let title = decodeHtmlEntities(item.source || item.title) || q;
+          if (item.title && typeof item.title === "string" && title.endsWith(item.title + item.title)) {
+            title = title.slice(0, -item.title.length);
+          }
+          return {
+            title,
+            imageUrl: item.original_image || item.image,
+            thumbnailUrl: item.image || item.original_image,
+            sourceUrl: cleanSource || item.original_image || targetUrl,
+            width: item.original_width || item.image_width || null,
+            height: item.original_height || item.image_height || null,
+            domain: domain.replace(/^www\./, "")
+          };
+        });
+      }
+
+      if (data && Array.isArray(data.images_results) && data.images_results.length > 0) {
+        return data.images_results.slice(0, 30).map((item) => {
+          const cleanSource = unwrapSourceLink(item.link);
+          let domain = "";
+          try {
+            if (item.original) domain = new URL(item.original).hostname;
+            else if (cleanSource) domain = new URL(cleanSource).hostname;
+          } catch (_) {}
+          if (domain.includes("google.") && item.source) {
+            domain = item.source;
+          } else if (!domain && item.source) {
+            domain = item.source;
+          }
+          return {
+            title: decodeHtmlEntities(item.title) || q,
+            imageUrl: item.original || item.thumbnail,
+            thumbnailUrl: item.thumbnail || item.original,
+            sourceUrl: cleanSource || item.original || targetUrl,
+            width: item.original_width || null,
+            height: item.original_height || null,
+            domain: domain.replace(/^www\./, "")
+          };
+        });
+      }
+
+      if (data && Array.isArray(data.organic) && data.organic.length > 0) {
+        const organicWithImages = data.organic.filter((item) => item.image || item.images);
+        if (organicWithImages.length > 0) {
+          return organicWithImages.slice(0, 30).map((item) => {
+            const cleanSource = unwrapSourceLink(item.link);
+            let domain = "";
+            try {
+              if (cleanSource) domain = new URL(cleanSource).hostname;
+            } catch (_) {}
+            const imgUrl = item.image || (Array.isArray(item.images) ? item.images[0] : null);
+            return {
+              title: decodeHtmlEntities(item.title) || q,
+              imageUrl: imgUrl,
+              thumbnailUrl: imgUrl,
+              sourceUrl: cleanSource || targetUrl,
+              width: null,
+              height: null,
+              domain: domain.replace(/^www\./, "")
+            };
+          });
+        }
+      }
+
+      if (Array.isArray(data) && data.length > 0) {
+        return data.slice(0, 30).map((item) => {
+          const cleanSource = unwrapSourceLink(item.link || item.url);
+          let domain = "";
+          const src = item.original_image || item.image || item.image_url || item.url;
+          try {
+            if (cleanSource) domain = new URL(cleanSource).hostname;
+          } catch (_) {}
+          return {
+            title: decodeHtmlEntities(item.title) || q,
+            imageUrl: src,
+            thumbnailUrl: item.image || item.thumbnail || src,
+            sourceUrl: cleanSource || targetUrl,
+            width: item.original_width || null,
+            height: item.original_height || null,
+            domain: domain.replace(/^www\./, "")
+          };
+        });
+      }
+
+      if (rawBodyString && typeof rawBodyString === "string" && rawBodyString.includes("<")) {
+        const foundImages = [];
+        const seen = new Set();
+        const re = /"(https?:\/\/encrypted-tbn0\.gstatic\.com\/images\?q=[^"]+)"/g;
+        let m;
+        while ((m = re.exec(rawBodyString)) !== null && foundImages.length < 30) {
+          const u = m[1].replace(/\\u0026/g, "&").replace(/\\x26/g, "&");
+          if (!seen.has(u)) {
+            seen.add(u);
+            foundImages.push({
+              title: q,
+              imageUrl: u,
+              thumbnailUrl: u,
+              sourceUrl: targetUrl,
+              width: null,
+              height: null,
+              domain: "google.com"
+            });
+          }
+        }
+        if (foundImages.length > 0) return foundImages;
+      }
+
+      if (data && (Array.isArray(data.images) || Array.isArray(data.images_results))) {
+        return [];
+      }
+
+      if (data && typeof data === "object") {
+        const keys = Object.keys(data).join(", ");
+        throw new Error(
+          `Bright Data returned [${keys}], but no image grid. In Bright Data dashboard → ${this.zone} → Configuration → Data format, select 'Full JSON' and click Save changes.`
+        );
+      }
+    } catch (serpErr) {
+      const msg = String(serpErr?.message || "");
+      if (
+        msg.includes("Full JSON") ||
+        msg.includes("API Key") ||
+        msg.includes("Bright Data error:") ||
+        msg.includes("authentication failed") ||
+        /\b(?:401|403)\b/.test(msg)
+      ) {
+        throw serpErr;
+      }
+      try {
+        const dResp = await requestWithTimeout({
+          url: "https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_m0cda3zn1y9cr8l8yr&format=json",
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify([{ url: targetUrl }])
+        });
+
+        if (dResp.status == null || dResp.status === 200) {
+          let list = Array.isArray(dResp.json) ? dResp.json : null;
+          if (!list && typeof dResp.text === "string") {
+            try {
+              list = JSON.parse(dResp.text);
+            } catch (_) {}
+          }
+          if (Array.isArray(list) && list.length > 0) {
+            return list.slice(0, 24).map((item) => {
+              let domain = "";
+              try {
+                if (item.url) domain = new URL(item.url).hostname;
+              } catch (_) {}
+              return {
+                title: decodeHtmlEntities(item.title) || q,
+                imageUrl: item.image_url || item.url,
+                thumbnailUrl: item.image_url || item.url,
+                sourceUrl: item.url || targetUrl,
+                width: null,
+                height: null,
+                domain: domain.replace(/^www\./, "")
+              };
+            });
+          }
+        }
+      } catch (_) {
+        throw serpErr;
+      }
+      throw serpErr;
+    }
+
+    throw new Error(
+      `Unexpected Bright Data response format. In Bright Data dashboard → ${this.zone} → Configuration → Data format, select 'Full JSON' and Save changes.`
+    );
   }
 }
 
@@ -1634,6 +2001,21 @@ class BatchImageReviewModal extends Modal {
     this.fetchGeneration = 0;
     this.insertBtn = null;
     this.selectionCount = null;
+    this.currentProviderId = plugin.settings?.defaultProvider || "duckduckgo";
+  }
+
+  getProviderDisplayName(id) {
+    switch (id) {
+      case "brightdata":
+        return "Bright Data Google Images";
+      case "brave":
+        return "Brave Images";
+      case "wikimedia":
+        return "Wikimedia Commons";
+      case "duckduckgo":
+      default:
+        return "DuckDuckGo";
+    }
   }
 
   updateFooter() {
@@ -1670,13 +2052,29 @@ class BatchImageReviewModal extends Modal {
 
     const topBar = contentEl.createDiv({ cls: "mifm-batch-top-bar" });
     const desc = topBar.createEl("p", {
-      text: `Searching DuckDuckGo for ${this.suggestions.length} topics. Tap thumbnails to select 1 or more images per topic.`,
+      text: `Reviewing ${this.suggestions.length} topics. Tap thumbnails to select 1 or more images per topic.`,
       cls: "mifm-scan-hero-desc"
     });
     desc.style.margin = "0 0 6px 0";
 
     const toolbar = topBar.createDiv({ cls: "mifm-batch-toolbar" });
-    toolbar.createSpan({ cls: "mifm-batch-toolbar-label", text: "🦆 Engine: DuckDuckGo (Free / No API)" });
+    toolbar.createSpan({ cls: "mifm-batch-toolbar-label", text: "🔍 Engine:" });
+
+    const providerSelect = toolbar.createEl("select", { cls: "mifm-batch-provider-select" });
+    const providerOptions = [
+      { id: "duckduckgo", label: "🦆 DuckDuckGo (Free / No Key)" },
+      { id: "brightdata", label: `🌐 Bright Data ${this.plugin.settings.brightDataApiKey ? "✓" : "(API Key)"}` },
+      { id: "brave", label: `🦁 Brave ${this.plugin.settings.braveApiKey ? "✓" : "(API Key)"}` },
+      { id: "wikimedia", label: "📚 Wikimedia (Free)" }
+    ];
+    providerOptions.forEach((opt) => {
+      const el = providerSelect.createEl("option", { text: opt.label, value: opt.id });
+      if (opt.id === this.currentProviderId) el.selected = true;
+    });
+    providerSelect.onchange = () => {
+      this.currentProviderId = providerSelect.value;
+      new Notice(`Switched batch engine to ${this.getProviderDisplayName(this.currentProviderId)}`);
+    };
 
     const refreshAllBtn = toolbar.createEl("button", {
       cls: "mifm-btn mifm-btn-refresh-all",
@@ -1687,7 +2085,10 @@ class BatchImageReviewModal extends Modal {
     };
 
     const progressContainer = contentEl.createDiv({ cls: "mifm-batch-progress-box" });
-    const progressLabel = progressContainer.createDiv({ cls: "mifm-batch-progress-label", text: "🔍 Searching DuckDuckGo..." });
+    const progressLabel = progressContainer.createDiv({
+      cls: "mifm-batch-progress-label",
+      text: `🔍 Searching ${this.getProviderDisplayName(this.currentProviderId)}...`
+    });
     const progressBar = progressContainer.createEl("progress", { cls: "mifm-batch-progress-bar" });
     progressBar.max = this.suggestions.length;
     progressBar.value = 0;
@@ -1823,12 +2224,14 @@ class BatchImageReviewModal extends Modal {
     await this.fetchAllCandidates(progressBar, progressLabel, progressContainer);
   }
 
-  async fetchSingleItem(rItem, bypassCache = false) {
+  async fetchSingleItem(rItem, customProviderId = null, bypassCache = false) {
     if (this.isClosed) return { cached: false };
     const itemGen = (rItem._searchGen = (rItem._searchGen || 0) + 1);
-    const provider = this.plugin.getActiveProvider();
+    const providerId = customProviderId || this.currentProviderId || this.plugin.settings?.defaultProvider || "duckduckgo";
+    const provider = this.plugin.getProvider(providerId);
     const t0 = Date.now();
     rItem.loading = true;
+    rItem.loadingProviderId = providerId;
     rItem.error = null;
     rItem.insertError = null;
     try {
@@ -1837,6 +2240,7 @@ class BatchImageReviewModal extends Modal {
       if (this.isClosed || itemGen !== rItem._searchGen) return { cached: false, stale: true };
       rItem.items = results;
       rItem.loading = false;
+      rItem.loadingProviderId = null;
       if (results.length > 0) {
         const alreadyInserted = this.view.insertedSuggestionIndices?.has(rItem.suggestion?._idx);
         rItem.included = !alreadyInserted;
@@ -1846,12 +2250,13 @@ class BatchImageReviewModal extends Modal {
         rItem.included = false;
         rItem.selectedIndices = [];
         rItem.selectedIdx = 0;
-        rItem.error = "No images returned by DuckDuckGo. Edit keywords and tap Retry.";
+        rItem.error = `No images returned by ${this.getProviderDisplayName(providerId)}. Edit keywords or try another engine.`;
       }
       return { cached: Date.now() - t0 < 15 };
     } catch (err) {
       if (this.isClosed || itemGen !== rItem._searchGen) return { cached: false, stale: true };
       rItem.loading = false;
+      rItem.loadingProviderId = null;
       rItem.error = safeError(err);
       rItem.included = false;
       rItem.selectedIndices = [];
@@ -1870,29 +2275,45 @@ class BatchImageReviewModal extends Modal {
         progressBar.value = 0;
       }
 
-      const delayMs = 750;
-      for (let i = 0; i < this.reviewItems.length; i++) {
-        if (this.isClosed || gen !== this.fetchGeneration) break;
-        const item = this.reviewItems[i];
-        item.loading = true;
-        item.error = null;
-        item.insertError = null;
-        this.updateCard(item);
+      const engineId = this.currentProviderId || "duckduckgo";
+      const concurrency = (engineId === "duckduckgo" || engineId === "brave") ? 1 : Math.min(3, this.reviewItems.length);
+      const delayMs = engineId === "duckduckgo" ? 650 : engineId === "brave" ? 1050 : 120;
+      let nextIdx = 0;
+      let started = 0;
+      let completed = 0;
 
-        if (progressLabel) {
-          progressLabel.setText(`Searching DuckDuckGo... (${i + 1}/${this.reviewItems.length})`);
+      const worker = async () => {
+        while (!this.isClosed && gen === this.fetchGeneration) {
+          const i = nextIdx++;
+          if (i >= this.reviewItems.length) break;
+          const item = this.reviewItems[i];
+          started++;
+          item.loading = true;
+          item.loadingProviderId = engineId;
+          item.error = null;
+          item.insertError = null;
+          this.updateCard(item);
+
+          if (progressLabel) {
+            progressLabel.setText(`Searching ${this.getProviderDisplayName(engineId)}... (${started}/${this.reviewItems.length})`);
+          }
+          const meta = await this.fetchSingleItem(item, engineId, bypassCache);
+          if (this.isClosed || gen !== this.fetchGeneration) break;
+          if (meta && meta.stale) continue;
+
+          completed++;
+          this.updateCard(item);
+          if (progressBar) progressBar.value = completed;
+
+          if (!meta?.cached && nextIdx < this.reviewItems.length && !this.isClosed && gen === this.fetchGeneration) {
+            await new Promise((res) => setTimeout(res, delayMs));
+          }
         }
-        const meta = await this.fetchSingleItem(item, bypassCache);
-        if (this.isClosed || gen !== this.fetchGeneration) break;
-        if (meta && meta.stale) continue;
+      };
 
-        this.updateCard(item);
-        if (progressBar) progressBar.value = i + 1;
-
-        if (!meta?.cached && i + 1 < this.reviewItems.length && !this.isClosed && gen === this.fetchGeneration) {
-          await new Promise((res) => setTimeout(res, delayMs));
-        }
-      }
+      const workers = [];
+      for (let w = 0; w < concurrency; w++) workers.push(worker());
+      await Promise.all(workers);
     } finally {
       if (gen === this.fetchGeneration) {
         this.isFetchingAll = false;
@@ -1961,7 +2382,7 @@ class BatchImageReviewModal extends Modal {
 
     if (r.loading) {
       const loadBox = card.createDiv({ cls: "mifm-batch-loading" });
-      loadBox.setText("⏳ Searching DuckDuckGo...");
+      loadBox.setText(`⏳ Searching ${this.getProviderDisplayName(r.loadingProviderId || this.currentProviderId)}...`);
       return;
     }
 
@@ -2097,7 +2518,7 @@ class BatchImageReviewModal extends Modal {
       r.query = queryInput.value.trim();
     };
 
-    const runSingleSearch = async () => {
+    const runSingleSearch = async (customProviderId = null) => {
       const q = queryInput.value.trim();
       if (!q) {
         new Notice("Enter a search query first.");
@@ -2106,15 +2527,16 @@ class BatchImageReviewModal extends Modal {
       }
       r.query = q;
       r.loading = true;
+      r.loadingProviderId = customProviderId || this.currentProviderId;
       this.updateCard(r);
-      await this.fetchSingleItem(r, true);
+      await this.fetchSingleItem(r, customProviderId, true);
       this.updateCard(r);
     };
 
     queryInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
         e.preventDefault();
-        runSingleSearch();
+        runSingleSearch(null);
       }
     });
 
@@ -2122,7 +2544,43 @@ class BatchImageReviewModal extends Modal {
       cls: "mifm-btn mifm-batch-card-retry",
       text: isErrorState ? "🔄 Retry" : "🔄 Re-search"
     });
-    retryBtn.onclick = () => runSingleSearch();
+    retryBtn.onclick = () => runSingleSearch(null);
+
+    const altEngines = [
+      {
+        id: "brightdata",
+        label: "🌐 Bright Data",
+        keyProp: "brightDataApiKey",
+        missingMsg: "Bright Data API Key is missing. Add it in Settings → Medical Image Finder Mobile."
+      },
+      {
+        id: "brave",
+        label: "🦁 Brave",
+        keyProp: "braveApiKey",
+        missingMsg: "Brave API Key is missing. Add it in Settings → Medical Image Finder Mobile."
+      },
+      {
+        id: "duckduckgo",
+        label: "🦆 DDG",
+        keyProp: null,
+        missingMsg: ""
+      }
+    ];
+
+    for (const eng of altEngines) {
+      if (eng.id === (r.loadingProviderId || this.currentProviderId)) continue;
+      const btn = cardActions.createEl("button", {
+        cls: "mifm-btn mifm-batch-card-alt",
+        text: eng.label
+      });
+      btn.onclick = async () => {
+        if (eng.keyProp && !this.plugin.settings[eng.keyProp]) {
+          new Notice(eng.missingMsg, 5000);
+          return;
+        }
+        await runSingleSearch(eng.id);
+      };
+    }
   }
 
   onClose() {
@@ -2188,6 +2646,17 @@ class MedicalImageFinderMobileView extends ItemView {
     if (this.searchTargetContext && (!file || this.searchTargetContext.file === file) && this.searchTargetContext.editor) {
       this.searchTargetContext.content = this.searchTargetContext.editor.getValue();
     }
+  }
+
+  updateTargetHeader() {
+    if (this.closed || !this.contentEl) return;
+    const activeFile = this.plugin.getTargetView()?.file;
+    const targetEl = this.contentEl.querySelector?.(".mifm-target-note");
+    if (activeFile && targetEl) {
+      targetEl.setText(`Target: ${activeFile.basename}`);
+      return;
+    }
+    this.render();
   }
 
   updateScanContextStatus() {
@@ -2271,14 +2740,15 @@ class MedicalImageFinderMobileView extends ItemView {
       return;
     }
 
+    const provider = this.plugin.getActiveProvider();
+    const providerId = this.plugin.settings?.defaultProvider || "duckduckgo";
     this.isAutoPiloting = true;
     this.render();
-    new Notice(`🚀 Auto-Pilot: Searching DuckDuckGo for ${remaining.length} topics...`, 6000);
+    new Notice(`🚀 Auto-Pilot: Searching ${provider.name} for ${remaining.length} topics...`, 6000);
 
     try {
       const jobs = [];
-      const provider = this.plugin.getActiveProvider();
-      const delayMs = 750;
+      const delayMs = providerId === "duckduckgo" ? 650 : providerId === "brave" ? 1050 : 120;
       let lastWasCached = false;
 
       for (let i = 0; i < suggestions.length; i++) {
@@ -2645,8 +3115,11 @@ class MedicalImageFinderMobileView extends ItemView {
     root.empty();
     root.addClass("mifm-container");
 
+    const activeProviderId = this.plugin.settings?.defaultProvider || "duckduckgo";
+    const activeProviderMeta = SEARCH_PROVIDERS.find((p) => p.id === activeProviderId) || SEARCH_PROVIDERS[0];
+
     const header = root.createDiv({ cls: "mifm-header" });
-    header.createDiv({ text: "MEDICINE & SURGERY ATLAS • DUCKDUCKGO", cls: "mifm-kicker" });
+    header.createDiv({ text: `MEDICINE & SURGERY ATLAS • ${activeProviderMeta.shortLabel}`, cls: "mifm-kicker" });
 
     const titleRow = header.createDiv({ cls: "mifm-title-row" });
     titleRow.createEl("h3", { text: "Medical Image Finder Mobile", cls: "mifm-title" });
@@ -2766,6 +3239,30 @@ class MedicalImageFinderMobileView extends ItemView {
       if (val) this.executeSearch(val);
     };
 
+    const providerRow = form.createDiv({ cls: "mifm-provider-row" });
+    providerRow.createSpan({ text: "Engine:", cls: "mifm-provider-label" });
+    const providerSelect = providerRow.createEl("select", { cls: "mifm-provider-select" });
+    const providerChoices = [
+      { id: "duckduckgo", label: "🦆 DuckDuckGo (Free / No Key)" },
+      { id: "brightdata", label: `🌐 Bright Data Google Images ${this.plugin.settings.brightDataApiKey ? "✓" : "(API Key)"}` },
+      { id: "brave", label: `🦁 Brave Images ${this.plugin.settings.braveApiKey ? "✓" : "(API Key)"}` },
+      { id: "wikimedia", label: "📚 Wikimedia Commons (Free)" }
+    ];
+    providerChoices.forEach((opt) => {
+      const el = providerSelect.createEl("option", { text: opt.label, value: opt.id });
+      if (opt.id === activeProviderId) el.selected = true;
+    });
+    providerSelect.onchange = async () => {
+      this.plugin.settings.defaultProvider = providerSelect.value;
+      await this.plugin.saveSettings();
+      const val = this.queryInput ? this.queryInput.value.trim() : (this.currentQuery || "").trim();
+      if (val) {
+        this.executeSearch(val);
+      } else {
+        this.render();
+      }
+    };
+
     const filterBar = form.createDiv({ cls: "mifm-filter-bar" });
     MEDICAL_VISUAL_FILTERS.forEach((filter) => {
       const pill = filterBar.createEl("button", {
@@ -2823,9 +3320,25 @@ class MedicalImageFinderMobileView extends ItemView {
     if (this.results.length === 0 && !this.isSearching) {
       const emptyState = root.createDiv({ cls: "mifm-empty-state" });
       emptyState.createDiv({ text: "🩺", cls: "mifm-empty-icon" });
-      emptyState.createEl("h3", { text: "DuckDuckGo Medical Image Search" });
+      const emptyTitles = {
+        duckduckgo: "DuckDuckGo Medical Image Search",
+        brightdata: "Bright Data Google Images Search",
+        brave: "Brave Medical Image Search",
+        wikimedia: "Wikimedia Commons Medical Search"
+      };
+      const emptyDescs = {
+        duckduckgo: "Zero API keys needed. Select text in your note or type any anatomical/radiology query above.",
+        brightdata: this.plugin.settings.brightDataApiKey
+          ? "Using Google Images via Bright Data. Type a medical query or select note text above."
+          : "Enter your Bright Data API key in Settings → Medical Image Finder Mobile (5,000 free/month).",
+        brave: this.plugin.settings.braveApiKey
+          ? "Using Brave Image Search API. Type a medical query or select note text above."
+          : "Enter your Brave API key in Settings → Medical Image Finder Mobile.",
+        wikimedia: "Free open-license anatomical and pathology illustrations from Wikimedia Commons."
+      };
+      emptyState.createEl("h3", { text: emptyTitles[activeProviderId] || "Medical Image Search" });
       emptyState.createEl("p", {
-        text: "Zero API keys needed. Select text in your note or type any anatomical/radiology query above."
+        text: emptyDescs[activeProviderId] || "Select text in your note or type any anatomical/radiology query above."
       });
       return;
     }
@@ -2918,7 +3431,7 @@ class MedicalImageFinderMobileView extends ItemView {
     const hero = container.createDiv({ cls: "mifm-scan-hero" });
     hero.createEl("h4", { text: "⚡ AI Note Visual Scanner", cls: "mifm-scan-hero-title" });
     hero.createEl("p", {
-      text: "Finds missing anatomical diagrams, triangles, operative repairs, and radiology signs, then searches DuckDuckGo in batch.",
+      text: "Finds missing anatomical diagrams, triangles, operative repairs, and radiology signs, then searches your selected engine in batch.",
       cls: "mifm-scan-hero-desc"
     });
 
@@ -3193,7 +3706,7 @@ class MedicalImageFinderMobileView extends ItemView {
         } else {
           card.createDiv({
             cls: "mifm-status",
-            text: "No images found on DuckDuckGo for this query. Try 'Search images' with simpler keywords."
+            text: `No images found via ${this.plugin.getActiveProvider().name} for this query. Try 'Search images' with simpler keywords.`
           });
         }
       }
@@ -3220,7 +3733,7 @@ class MedicalImageFinderMobileView extends ItemView {
 }
 
 // -------------------------------------------------------------
-// Settings Tab (Zero Image-Search API Clutter)
+// Settings Tab (Mobile-First)
 // -------------------------------------------------------------
 
 class MedicalImageFinderMobileSettingTab extends PluginSettingTab {
@@ -3235,9 +3748,25 @@ class MedicalImageFinderMobileSettingTab extends PluginSettingTab {
 
     containerEl.createEl("h2", { text: "Medical Image Finder Mobile Settings" });
     containerEl.createEl("p", {
-      text: "Image search uses DuckDuckGo (zero API keys) on iPadOS, Android, and Desktop.",
+      text: "Defaults to DuckDuckGo (zero API keys) on iPadOS, Android, and Desktop. Optionally add Bright Data or Brave API keys for Google/Brave image search.",
       cls: "setting-item-description"
     });
+
+    new Setting(containerEl)
+      .setName("Default Search Engine")
+      .setDesc("Choose which image search engine to use by default.")
+      .addDropdown((drop) => {
+        drop
+          .addOption("duckduckgo", "DuckDuckGo (Free / No Key)")
+          .addOption("brightdata", "Bright Data Google Images (5,000 Free/Mo)")
+          .addOption("brave", "Brave Search API")
+          .addOption("wikimedia", "Wikimedia Commons (Free)")
+          .setValue(this.plugin.settings.defaultProvider || "duckduckgo")
+          .onChange(async (val) => {
+            this.plugin.settings.defaultProvider = val;
+            await this.plugin.saveSettings();
+          });
+      });
 
     new Setting(containerEl)
       .setName("Default Visual Mode Filter")
@@ -3314,6 +3843,97 @@ class MedicalImageFinderMobileSettingTab extends PluginSettingTab {
             this.plugin.settings.geminiMaxSuggestions = parseInt(val, 10);
             await this.plugin.saveSettings();
           });
+      });
+
+    containerEl.createEl("h3", { text: "Bright Data Google Images (5,000 Free Records/Month)" });
+    containerEl.createEl("p", {
+      text: "5,000 free Google Image records/month (no credit card required). Sign up at brightdata.com, set zone Data format to 'Full JSON', and enter your API token below.",
+      cls: "setting-item-description"
+    });
+
+    new Setting(containerEl)
+      .setName("Bright Data API Key")
+      .setDesc("Enter your Bright Data API token (Bearer token).")
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text
+          .setPlaceholder("Bearer token or API key")
+          .setValue(this.plugin.settings.brightDataApiKey || "")
+          .onChange(async (val) => {
+            this.plugin.settings.brightDataApiKey = val.trim();
+            await this.plugin.saveSettings();
+          });
+      })
+      .addButton((btn) => {
+        btn.setButtonText("Test").onClick(async () => {
+          const key = this.plugin.settings.brightDataApiKey;
+          if (!key) {
+            new Notice("Enter your Bright Data API key first.");
+            return;
+          }
+          btn.setButtonText("Testing…").setDisabled(true);
+          try {
+            const p = new BrightDataProvider(key, this.plugin.settings.brightDataZone);
+            const res = await p.search("Calot triangle anatomy diagram");
+            new Notice(`✅ Bright Data connected (${res.length} images found).`, 5000);
+          } catch (err) {
+            new Notice(`❌ Bright Data test failed: ${safeError(err)}`, 7000);
+          } finally {
+            btn.setButtonText("Test").setDisabled(false);
+          }
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Bright Data SERP Zone")
+      .setDesc("Zone name configured in your Bright Data dashboard (defaults to 'serp_api1').")
+      .addText((text) => {
+        text
+          .setPlaceholder("serp_api1")
+          .setValue(this.plugin.settings.brightDataZone || "serp_api1")
+          .onChange(async (val) => {
+            this.plugin.settings.brightDataZone = val.trim() || "serp_api1";
+            await this.plugin.saveSettings();
+          });
+      });
+
+    containerEl.createEl("h3", { text: "Brave Search API (Optional)" });
+    containerEl.createEl("p", {
+      text: "Optional Brave Image Search API key from api-dashboard.search.brave.com.",
+      cls: "setting-item-description"
+    });
+
+    new Setting(containerEl)
+      .setName("Brave API Key")
+      .setDesc("Enter your Brave Search API subscription token.")
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text
+          .setPlaceholder("BSA...")
+          .setValue(this.plugin.settings.braveApiKey || "")
+          .onChange(async (val) => {
+            this.plugin.settings.braveApiKey = val.trim();
+            await this.plugin.saveSettings();
+          });
+      })
+      .addButton((btn) => {
+        btn.setButtonText("Test").onClick(async () => {
+          const key = this.plugin.settings.braveApiKey;
+          if (!key) {
+            new Notice("Enter your Brave API key first.");
+            return;
+          }
+          btn.setButtonText("Testing…").setDisabled(true);
+          try {
+            const p = new BraveProvider(key);
+            const res = await p.search("Calot triangle anatomy diagram");
+            new Notice(`✅ Brave connected (${res.length} images found).`, 5000);
+          } catch (err) {
+            new Notice(`❌ Brave test failed: ${safeError(err)}`, 7000);
+          } finally {
+            btn.setButtonText("Test").setDisabled(false);
+          }
+        });
       });
 
     containerEl.createEl("h3", { text: "AI Visual Scanner (Optional Gemini API)" });
@@ -3415,6 +4035,7 @@ class MedicalImageFinderMobilePlugin extends Plugin {
     await this.loadSettings();
     this.disposed = false;
     this.pendingActions = new Map();
+    this.inFlightSearches = new Map();
     this.writeQueue = Promise.resolve();
     this.searchCache = new SearchCache();
     this.lastSelectionText = "";
@@ -3423,17 +4044,26 @@ class MedicalImageFinderMobilePlugin extends Plugin {
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", (leaf) => {
         if (!(leaf?.view instanceof MarkdownView)) return;
+        const prevFile = this.lastMarkdownView?.file;
         this.lastMarkdownView = leaf.view;
         const sel = leaf.view.editor?.getSelection()?.trim();
         if (sel) this.lastSelectionText = sel;
-        for (const l of this.app.workspace.getLeavesOfType(VIEW_TYPE_MIFM)) l.view.render();
+        if (leaf.view.file !== prevFile) {
+          for (const l of this.app.workspace.getLeavesOfType(VIEW_TYPE_MIFM)) {
+            if (typeof l.view.updateTargetHeader === "function") l.view.updateTargetHeader();
+            else l.view.render();
+          }
+        }
       })
     );
 
     this.registerEvent(
       this.app.workspace.on("file-open", () => {
         this.getTargetView();
-        for (const l of this.app.workspace.getLeavesOfType(VIEW_TYPE_MIFM)) l.view.render();
+        for (const l of this.app.workspace.getLeavesOfType(VIEW_TYPE_MIFM)) {
+          if (typeof l.view.updateTargetHeader === "function") l.view.updateTargetHeader();
+          else l.view.render();
+        }
       })
     );
 
@@ -3464,7 +4094,7 @@ class MedicalImageFinderMobilePlugin extends Plugin {
 
     this.addCommand({
       id: "find-images-mobile",
-      name: "Find images (DuckDuckGo)",
+      name: "Find images",
       editorCallback: (editor, view) => {
         this.triggerSearchFromEditor(editor, view);
       }
@@ -3514,6 +4144,7 @@ class MedicalImageFinderMobilePlugin extends Plugin {
       this._editorChangeTimer = null;
     }
     if (this.searchCache) this.searchCache.clear();
+    if (this.inFlightSearches) this.inFlightSearches.clear();
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_MIFM);
   }
 
@@ -3525,12 +4156,33 @@ class MedicalImageFinderMobilePlugin extends Plugin {
       const cached = this.searchCache.get(cacheKey);
       if (cached) return cached;
     }
-    const results = await provider.search(query);
-    const normalized = normalizeResults(results);
-    if (!bypassCache && this.searchCache && normalized.length > 0) {
-      this.searchCache.set(cacheKey, normalized);
+    if (!bypassCache) {
+      if (!this.inFlightSearches) this.inFlightSearches = new Map();
+      const existing = this.inFlightSearches.get(cacheKey);
+      if (existing) {
+        const res = await existing;
+        return Array.isArray(res) ? res.map((item) => ({ ...item })) : res;
+      }
     }
-    return normalized;
+    const run = (async () => {
+      const results = await provider.search(query);
+      const normalized = normalizeResults(results);
+      if (!bypassCache && this.searchCache && normalized.length > 0) {
+        this.searchCache.set(cacheKey, normalized);
+      }
+      return normalized;
+    })();
+    if (!bypassCache && this.inFlightSearches) {
+      this.inFlightSearches.set(cacheKey, run);
+    }
+    try {
+      const res = await run;
+      return Array.isArray(res) ? res.map((item) => ({ ...item })) : res;
+    } finally {
+      if (!bypassCache && this.inFlightSearches) {
+        this.inFlightSearches.delete(cacheKey);
+      }
+    }
   }
 
   async loadSettings() {
@@ -3541,6 +4193,7 @@ class MedicalImageFinderMobilePlugin extends Plugin {
   async saveSettings({ clearCache = true } = {}) {
     rememberSecrets(this.settings);
     if (clearCache && this.searchCache) this.searchCache.clear();
+    if (clearCache && this.inFlightSearches) this.inFlightSearches.clear();
     const snapshot = JSON.parse(JSON.stringify(this.settings));
     const pending = (this.settingsWriteQueue || Promise.resolve()).catch(() => {}).then(() => this.saveData(snapshot));
     this.settingsWriteQueue = pending;
@@ -3551,8 +4204,23 @@ class MedicalImageFinderMobilePlugin extends Plugin {
     }
   }
 
+  getProvider(providerId = null) {
+    const id = providerId || this.settings?.defaultProvider || "duckduckgo";
+    switch (id) {
+      case "brightdata":
+        return new BrightDataProvider(this.settings?.brightDataApiKey, this.settings?.brightDataZone);
+      case "brave":
+        return new BraveProvider(this.settings?.braveApiKey);
+      case "wikimedia":
+        return new WikimediaProvider();
+      case "duckduckgo":
+      default:
+        return new DuckDuckGoProvider();
+    }
+  }
+
   getActiveProvider() {
-    return new DuckDuckGoProvider();
+    return this.getProvider(this.settings?.defaultProvider);
   }
 
   async activateView() {
@@ -4098,6 +4766,7 @@ class MedicalImageFinderMobilePlugin extends Plugin {
       );
 
       const downloadedMap = new Map();
+      const batchUrlDownloads = new Map();
       let nextDl = 0;
       let completedCount = 0;
       const dlWorkers = [];
@@ -4109,8 +4778,14 @@ class MedicalImageFinderMobilePlugin extends Plugin {
               const idx = nextDl++;
               if (idx >= plannedJobs.length) break;
               const job = plannedJobs[idx];
+              const urlKey = `${job.imageItem?.imageUrl || ""}|${job.imageItem?.thumbnailUrl || ""}`;
               try {
-                const image = await this.downloadImage(job.imageItem);
+                let dlPromise = batchUrlDownloads.get(urlKey);
+                if (!dlPromise) {
+                  dlPromise = this.downloadImage(job.imageItem);
+                  batchUrlDownloads.set(urlKey, dlPromise);
+                }
+                const image = await dlPromise;
                 downloadedMap.set(idx, image);
               } catch (err) {
                 console.error(`Failed to download batch image for ${job.targetConcept}:`, err);
@@ -4188,6 +4863,7 @@ class MedicalImageFinderMobilePlugin extends Plugin {
 
 MedicalImageFinderMobilePlugin._internals = {
   DEFAULT_SETTINGS,
+  SEARCH_PROVIDERS,
   MEDICAL_VISUAL_FILTERS,
   base64ToUint8Array,
   utf8ToUint8Array,
@@ -4207,6 +4883,8 @@ MedicalImageFinderMobilePlugin._internals = {
   SearchCache,
   DuckDuckGoProvider,
   WikimediaProvider,
+  BraveProvider,
+  BrightDataProvider,
   OfflineMedicalScanner,
   GeminiScannerService,
   AiResponseImportModal,

@@ -126,23 +126,35 @@ test("imageExtension and binary helpers work cleanly on Uint8Array", () => {
   assert.equal(ab.byteLength, png.length);
 });
 
-test("normalizeSettings enforces mobile defaults without third-party search APIs", () => {
+test("normalizeSettings enforces mobile defaults with DuckDuckGo default plus Bright Data and Brave support", () => {
   const { PluginClass } = loadPluginWithMock();
   const { normalizeSettings } = PluginClass._internals;
 
   const s = normalizeSettings({
+    defaultProvider: "serpapi",
     defaultFilterMode: "invalid",
     aiBackend: "groq",
     geminiMaxSuggestions: 99,
     defaultImageWidth: 10,
-    attachmentFolder: "/abs/bad"
+    attachmentFolder: "/abs/bad",
+    brightDataApiKey: "  bd_test_key  ",
+    brightDataZone: "   ",
+    braveApiKey: "  BSA_test_key  "
   });
 
+  assert.equal(s.defaultProvider, "duckduckgo");
   assert.equal(s.defaultFilterMode, "all");
   assert.equal(s.aiBackend, "gemini");
   assert.equal(s.geminiMaxSuggestions, 25);
   assert.equal(s.defaultImageWidth, 500);
   assert.equal(s.attachmentFolder, "Attachments/MedicalImages");
-  assert.equal("brightDataApiKey" in s, false);
+  assert.equal(s.brightDataApiKey, "bd_test_key");
+  assert.equal(s.brightDataZone, "serp_api1");
+  assert.equal(s.braveApiKey, "BSA_test_key");
   assert.equal("serpApiKey" in s, false);
+  assert.equal("googleApiKey" in s, false);
+
+  assert.equal(normalizeSettings({ defaultProvider: "brightdata" }).defaultProvider, "brightdata");
+  assert.equal(normalizeSettings({ defaultProvider: "brave" }).defaultProvider, "brave");
+  assert.equal(normalizeSettings({ defaultProvider: "wikimedia" }).defaultProvider, "wikimedia");
 });

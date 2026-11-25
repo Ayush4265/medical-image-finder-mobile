@@ -141,9 +141,11 @@ test("batchInsertImages inserts bottom-to-top without line drift and deduplicate
     "- Point C: Next bullet."
   ];
   const pngBytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4]);
-  const { plugin, editor, view, files } = setupPlugin(note, async () => ({
-    arrayBuffer: pngBytes.buffer.slice(0)
-  }));
+  let downloadCalls = 0;
+  const { plugin, editor, view, files } = setupPlugin(note, async () => {
+    downloadCalls++;
+    return { arrayBuffer: pngBytes.buffer.slice(0) };
+  });
 
   const ctx = plugin.captureTarget();
   const jobs = [
@@ -178,6 +180,7 @@ test("batchInsertImages inserts bottom-to-top without line drift and deduplicate
   const result = await plugin.batchInsertImages(jobs);
   assert.equal(result.insertedCount, 2);
   assert.equal(files.size, 1);
+  assert.equal(downloadCalls, 1);
 
   const finalText = editor.getValue();
   const lines = finalText.split("\n");

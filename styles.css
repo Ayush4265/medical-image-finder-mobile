@@ -115,6 +115,31 @@
   background: var(--background-modifier-hover);
 }
 
+.mifm-provider-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.mifm-provider-label {
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.mifm-provider-select {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  font-size: 12px;
+}
+
 /* Filter bar: horizontally scrollable on narrow phones, wrapping on wider views */
 .mifm-filter-bar {
   display: flex;
@@ -222,6 +247,7 @@
   background: var(--background-primary);
   overflow: hidden;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  contain: layout style;
 }
 
 .mifm-thumb-container {
@@ -450,6 +476,7 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
+  contain: layout style;
 }
 
 .mifm-scan-card.is-inserted {
@@ -702,6 +729,17 @@ body .modal-container .modal.mifm-batch-modal-window .modal-content.mifm-batch-m
   font-weight: 600;
 }
 
+.mifm-batch-provider-select {
+  flex: 1 1 180px;
+  min-width: 0;
+  font-size: 12px;
+  padding: 4px 8px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+}
+
 .mifm-btn-refresh-all {
   flex: 0 0 auto;
   font-size: 11px;
@@ -907,6 +945,12 @@ body .modal-container .modal.mifm-batch-modal-window .modal-content.mifm-batch-m
   font-weight: 600;
 }
 
+.mifm-batch-card-alt {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 5px 9px;
+}
+
 .mifm-batch-modal .mifm-batch-footer {
   flex: 0 0 auto;
   display: flex;
@@ -961,7 +1005,9 @@ body .modal-container .modal.mifm-batch-modal-window .modal-content.mifm-batch-m
 body.is-mobile .mifm-query-input,
 body.is-mobile .mifm-batch-card-query-input,
 body.is-mobile .mifm-import-textarea,
-body.is-mobile .mifm-scan-count-select {
+body.is-mobile .mifm-scan-count-select,
+body.is-mobile .mifm-provider-select,
+body.is-mobile .mifm-batch-provider-select {
   font-size: 16px; /* Prevents iOS WKWebView auto-zoom on focus */
 }
 
@@ -969,7 +1015,9 @@ body.is-mobile .mifm-btn,
 body.is-mobile .mifm-btn-icon,
 body.is-mobile .mifm-tab,
 body.is-mobile .mifm-filter-pill,
-body.is-mobile .mifm-scan-btn {
+body.is-mobile .mifm-scan-btn,
+body.is-mobile .mifm-provider-select,
+body.is-mobile .mifm-batch-provider-select {
   min-height: 40px;
 }
 
