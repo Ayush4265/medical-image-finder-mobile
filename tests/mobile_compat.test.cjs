@@ -63,8 +63,14 @@ test("manifest.json declares mobile compatibility (isDesktopOnly: false)", () =>
   const manifest = JSON.parse(fs.readFileSync(path.join(PLUGIN_DIR, "manifest.json"), "utf8"));
   assert.equal(manifest.id, "medical-image-finder-mobile");
   assert.equal(manifest.isDesktopOnly, false);
-  assert.equal(manifest.version, "1.0.0");
+  assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
   assert.ok(manifest.minAppVersion);
+});
+
+test("styles.css avoids !important and :has() for Obsidian CSS lint compliance", () => {
+  const css = fs.readFileSync(path.join(PLUGIN_DIR, "styles.css"), "utf8");
+  assert.doesNotMatch(css, /!important/i);
+  assert.doesNotMatch(css, /:has\s*\(/i);
 });
 
 test("main.js has zero Node.js, Electron, Buffer, or desktop-only polling dependencies", () => {
