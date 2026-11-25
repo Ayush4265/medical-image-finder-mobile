@@ -438,3 +438,244 @@ test("View, SettingsTab, and BatchImageReviewModal render provider selectors cle
   await modal.onOpen();
   assert.ok(modal.contentEl.querySelector(".mifm-batch-provider-select"));
 });
+
+test("Regression: rememberSecrets ignores short typing prefixes, BrightData handles throwing json getter & 401 status, Brave handles status/code", async () => {
+  let bdCalls = 0;
+  let braveCalls = 0;
+  let mode = "bd_throwing_json_getter";
+
+  const { PluginClass } = loadPlugin(async ({ url }) => {
+    if (url.includes("api.brightdata.com")) {
+      bdCalls++;
+      if (mode === "bd_throwing_json_getter") {
+        return {
+          status: 200,
+          get json() {
+            throw new SyntaxError("Unexpected token '<'");
+          },
+          text: '<html><img src="https://encrypted-tbn0.gstatic.com/images?q=tbn:xyz\\u0026s=1"/></html>'
+        };
+      }
+      if (mode === "bd_throw_401_status_only") {
+        const err = new Error("Auth method is not supported");
+        err.status = 401;
+        throw err;
+      }
+      return { status: 200, json: { images: [] } };
+    }
+    if (url.includes("api.search.brave.com")) {
+      braveCalls++;
+      if (mode === "brave_429_status_only") {
+        if (braveCalls === 1) {
+          const err = new Error("Too many requests");
+          err.status = 429;
+          throw err;
+        }
+        return {
+          status: 200,
+          json: {
+            results: [
+              { title: "Retried OK", url: "https://example.org/ok", properties: { url: "https://example.org/ok.png" } }
+            ]
+          }
+        };
+      }
+      if (mode === "brave_token_invalid_json") {
+        return {
+          status: 200,
+          json: { error: { code: "SUBSCRIPTION_TOKEN_INVALID", detail: "Invalid subscription token" } }
+        };
+      }
+    }
+    throw new Error("Unexpected URL: " + url);
+  });
+
+  const { safeError, normalizeSettings, BrightDataProvider, BraveProvider, SearchCache } = PluginClass._internals;
+  const plugin = new PluginClass({}, { id: "medical-image-finder-mobile" });
+  plugin.settings = normalizeSettings({ brightDataApiKey: "B", braveApiKey: "a" });
+  plugin.searchCache = new SearchCache();
+  plugin.inFlightSearches = new Map();
+  plugin.saveData = async () => {};
+  await plugin.saveSettings({ clearCache: false });
+
+  // Short typing prefixes must not corrupt normal error messages
+  assert.equal(safeError(new Error("Bright Data authentication failed")), "Bright Data authentication failed");
+
+  const bd = new BrightDataProvider("bd_valid_key_1234", "serp_api1");
+  const htmlRes = await bd.search("calot");
+  assert.equal(htmlRes.length, 1);
+  assert.equal(htmlRes[0].imageUrl, "https://encrypted-tbn0.gstatic.com/images?q=tbn:xyz&s=1");
+
+  bdCalls = 0;
+  mode = "bd_throw_401_status_only";
+  await assert.rejects(() => bd.search("calot"), /Bright Data authentication failed \(HTTP 401\)/);
+  assert.equal(bdCalls, 1); // Must NOT fall back to Datasets v3 on 401
+
+  const brave = new BraveProvider("BSA_test_key_123456");
+  mode = "brave_429_status_only";
+  const retried = await brave.search("calot", 1);
+  assert.equal(braveCalls, 2);
+  assert.equal(retried[0].title, "Retried OK");
+
+  mode = "brave_token_invalid_json";
+  await assert.rejects(() => brave.search("calot", 1), /Brave API authentication failed/i);
+});
+
+test("Regression: BatchImageReviewModal tracks per-card providerId, fails fast on missing key, and updateTargetHeader avoids scan note collision", async () => {
+  function makeEl(tag = "div") {
+    return {
+      tagName: tag.toUpperCase(),
+      children: [],
+      classList: new Set(),
+      style: {},
+      dataset: {},
+      value: "",
+      checked: false,
+      disabled: false,
+      selected: false,
+      rows: 0,
+      max: 100,
+      _text: "",
+      _attrs: {},
+      empty() { this.children = []; return this; },
+      addClass(cls) { String(cls).split(/\s+/).filter(Boolean).forEach((c) => this.classList.add(c)); return this; },
+      removeClass(cls) { String(cls).split(/\s+/).filter(Boolean).forEach((c) => this.classList.delete(c)); return this; },
+      setText(t) { this._text = String(t ?? ""); return this; },
+      setAttribute(k, v) { this._attrs[k] = String(v); },
+      addEventListener() {},
+      querySelector(sel) {
+        if (sel.startsWith(".") && this.classList.has(sel.slice(1))) return this;
+        if (sel.startsWith("#") && this.id === sel.slice(1)) return this;
+        for (const c of this.children) {
+          const found = c.querySelector(sel);
+          if (found) return found;
+        }
+        return null;
+      },
+      querySelectorAll(sel) {
+        const out = [];
+        if (sel.startsWith(".") && this.classList.has(sel.slice(1))) out.push(this);
+        for (const c of this.children) out.push(...c.querySelectorAll(sel));
+        return out;
+      },
+      createDiv(opts = {}) { return this.createEl("div", opts); },
+      createSpan(opts = {}) { return this.createEl("span", opts); },
+      createEl(t, opts = {}) {
+        const child = makeEl(t);
+        if (opts.cls) child.addClass(opts.cls);
+        if (opts.text != null) child.setText(opts.text);
+        if (opts.value != null) child.value = String(opts.value);
+        if (opts.type != null) child._attrs.type = opts.type;
+        if (opts.attr) Object.assign(child._attrs, opts.attr);
+        this.children.push(child);
+        return child;
+      }
+    };
+  }
+
+  const originalLoad = Module._load;
+  class MockSetting {
+    setName() { return this; }
+    setDesc() { return this; }
+    addDropdown() { return this; }
+    addText() { return this; }
+    addToggle() { return this; }
+    addButton() { return this; }
+  }
+  class MockTFile { constructor(p) { this.path = p; this.basename = path.basename(p, ".md"); this.extension = "md"; } }
+
+  let PluginClass;
+  Module._load = function (req) {
+    if (req === "obsidian") {
+      return {
+        Plugin: class { constructor(app, m) { this.app = app; this.manifest = m; } },
+        ItemView: class { constructor(leaf) { this.leaf = leaf; this.contentEl = makeEl("div"); } },
+        Modal: class { constructor(app) { this.app = app; this.contentEl = makeEl("div"); this.modalEl = makeEl("div"); this.titleEl = makeEl("div"); } open() {} close() {} },
+        Notice: class {},
+        Setting: MockSetting,
+        PluginSettingTab: class { constructor(app, p) { this.app = app; this.plugin = p; this.containerEl = makeEl("div"); } },
+        normalizePath: (p) => p,
+        TFile: MockTFile,
+        MarkdownView: class {},
+        Platform: { isMobile: true },
+        requestUrl: async ({ url }) => {
+          if (url.includes("api.search.brave.com")) {
+            return { status: 200, json: { results: [{ title: "BraveImg", url: "https://example.org", properties: { url: "https://example.org/b.png" } }] } };
+          }
+          if (url.includes("iax=images")) return { text: 'vqd="4-999"' };
+          if (url.includes("/i.js")) return { json: { results: [{ title: "DdgImg", image: "https://example.org/d.png", url: "https://example.org" }] } };
+          return { status: 200, json: { images: [] } };
+        }
+      };
+    }
+    return originalLoad.apply(this, arguments);
+  };
+
+  try {
+    const mainPath = path.join(PLUGIN_DIR, "main.js");
+    delete require.cache[require.resolve(mainPath)];
+    PluginClass = require(mainPath);
+  } finally {
+    Module._load = originalLoad;
+  }
+
+  const { normalizeSettings, MedicalImageFinderMobileView, BatchImageReviewModal, SearchCache } = PluginClass._internals;
+  let activeFile = new MockTFile("Surgery/NoteA.md");
+  const leafView = { file: activeFile, editor: { getValue: () => "# A", lineCount: () => 1, getLine: () => "# A" }, leaf: {} };
+  const app = {
+    workspace: {
+      getActiveViewOfType: () => (activeFile ? { ...leafView, file: activeFile } : null),
+      getLeavesOfType: () => (activeFile ? [{ view: { ...leafView, file: activeFile } }] : [])
+    },
+    vault: { getAbstractFileByPath: () => activeFile }
+  };
+
+  const plugin = new PluginClass(app, { id: "medical-image-finder-mobile" });
+  plugin.settings = normalizeSettings({ defaultProvider: "duckduckgo", braveApiKey: "BSA_valid_test_key" });
+  plugin.searchCache = new SearchCache();
+  plugin.inFlightSearches = new Map();
+  plugin.pendingActions = new Map();
+  plugin.disposed = false;
+  plugin.saveData = async () => {};
+
+  const view = new MedicalImageFinderMobileView({ view: null }, plugin);
+  view.scanContext = { view: app.workspace.getActiveViewOfType(), file: activeFile, path: activeFile.path, editor: leafView.editor, content: "# A" };
+  view.scanResults = {
+    summary: "OK",
+    suggestions: [
+      { heading: "Calot", line: 1, visualConcept: "Calot triangle", visualType: "diagram", rationale: "Key", recommendedQuery: "Calot triangle" },
+      { heading: "Doom", line: 1, visualConcept: "Triangle of Doom", visualType: "diagram", rationale: "Key", recommendedQuery: "Triangle of Doom" }
+    ]
+  };
+
+  // Header note must remain distinct from Scanned note badge in scan tab
+  view.currentTab = "scan";
+  view.render();
+  activeFile = new MockTFile("Surgery/NoteB.md");
+  view.updateTargetHeader();
+  const noteTexts = view.contentEl.querySelectorAll(".mifm-target-note").map((el) => el._text);
+  assert.ok(noteTexts.includes("Target: NoteB"));
+  assert.ok(noteTexts.includes("Scanned: NoteA"));
+
+  // Per-card providerId switch: switching card 0 to Brave must persist providerId="brave" and expose DDG button
+  const modal = new BatchImageReviewModal(app, plugin, view);
+  await modal.onOpen();
+  const card0El = modal.contentEl.querySelector("#mifm-batch-card-0");
+  const braveBtn = card0El.querySelectorAll(".mifm-batch-card-alt").find((b) => b._text.includes("Brave"));
+  assert.ok(braveBtn);
+  await braveBtn.onclick();
+  assert.equal(modal.reviewItems[0].providerId, "brave");
+  const updatedCard0 = modal.contentEl.querySelector("#mifm-batch-card-0");
+  const altLabels = updatedCard0.querySelectorAll(".mifm-batch-card-alt").map((b) => b._text);
+  assert.equal(altLabels.some((t) => t.includes("Brave")), false);
+  assert.equal(altLabels.some((t) => t.includes("DDG")), true);
+
+  // Fatal missing-key check in fetchAllCandidates fails fast across all cards
+  plugin.settings.brightDataApiKey = "";
+  modal.currentProviderId = "brightdata";
+  const tStart = Date.now();
+  await modal.fetchAllCandidates(null, null, null, true);
+  assert.ok(Date.now() - tStart < 500);
+  assert.match(modal.reviewItems[0].error, /API Key/i);
+  assert.match(modal.reviewItems[1].error, /API Key/i);
+});

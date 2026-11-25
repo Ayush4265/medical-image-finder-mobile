@@ -304,19 +304,22 @@ function bindImageFallback(img, fallbackUrl) {
 const knownSecrets = new Set();
 function rememberSecrets(settings) {
   for (const key of ["brightDataApiKey", "braveApiKey", "geminiApiKey"]) {
-    if (typeof settings?.[key] === "string" && settings[key].trim()) {
-      knownSecrets.add(settings[key].trim());
+    const val = typeof settings?.[key] === "string" ? settings[key].trim() : "";
+    if (val.length >= 8) {
+      knownSecrets.add(val);
     }
   }
 }
 
 function safeError(error) {
   let message = String(error?.message || error || "Unknown error");
-  for (const secret of knownSecrets) message = message.split(secret).join("[redacted]");
+  const sortedSecrets = Array.from(knownSecrets).sort((a, b) => b.length - a.length);
+  for (const secret of sortedSecrets) message = message.split(secret).join("[redacted]");
   return message
     .replace(/https?:\/\/[^\s<>"']+/gi, "[request URL]")
     .replace(/((?:api[_-]?key|key|token|authorization)\s*[=:]\s*(?:bearer\s+)?)[^\s&,]+/gi, "$1[redacted]")
     .replace(/\bBearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]")
+    .replace(/\bBSA[A-Za-z0-9_-]{6,}\b/g, "[redacted]")
     .replace(/AIza[\w-]+/g, "[redacted]");
 }
 
@@ -515,18 +518,32 @@ async function fetchJson(url, headers = {}) {
         ...headers
       }
     });
-    const data = res.json;
+    let data = null;
+    try {
+      data = res.json;
+    } catch (_) {
+      if (typeof res.text === "string") data = JSON.parse(res.text);
+    }
     if (!data || typeof data !== "object") throw new Error("Unexpected API response.");
     if (data.error) {
-      throw new Error(
+      const apiErr = new Error(
         typeof data.error === "string"
           ? data.error
           : data.error.message || data.error.detail || "Provider rejected request."
       );
+      if (typeof data.error === "object") {
+        apiErr.status = data.error.status || res.status;
+        apiErr.code = data.error.code;
+      }
+      throw apiErr;
     }
     return data;
   } catch (err) {
-    throw new Error(`API request failed: ${safeError(err)}`);
+    const wrapped = new Error(`API request failed: ${safeError(err)}`);
+    if (err?.status != null) wrapped.status = err.status;
+    else if (err?.statusCode != null) wrapped.status = err.statusCode;
+    if (err?.code != null) wrapped.code = err.code;
+    throw wrapped;
   }
 }
 
@@ -703,11 +720,18 @@ class BraveProvider {
         break;
       } catch (err) {
         const msg = String(err?.message || "");
-        if (attempt === 0 && /\b429\b/.test(msg)) {
+        const errStatus = err?.status || err?.statusCode || 0;
+        if (attempt === 0 && (errStatus === 429 || /\b429\b/.test(msg))) {
           await new Promise((r) => setTimeout(r, retryDelayMs));
           continue;
         }
-        if (/\b(?:401|403|422)\b/.test(msg)) {
+        if (
+          errStatus === 401 ||
+          errStatus === 403 ||
+          errStatus === 422 ||
+          err?.code === "SUBSCRIPTION_TOKEN_INVALID" ||
+          /\b(?:401|403|422)\b|SUBSCRIPTION_TOKEN_INVALID/i.test(msg)
+        ) {
           throw new Error("Brave API authentication failed. Check your Brave API Key in Settings.");
         }
         throw err;
@@ -787,14 +811,17 @@ class BrightDataProvider {
         throw new Error(`Bright Data SERP HTTP ${status}`);
       }
 
-      let data = typeof resp.json === "object" && resp.json !== null ? resp.json : null;
-      if (!data && typeof resp.text === "string") {
+      let data = null;
+      try {
+        if (typeof resp?.json === "object" && resp.json !== null) data = resp.json;
+      } catch (_) {}
+      if (!data && typeof resp?.text === "string") {
         try {
           data = JSON.parse(resp.text);
         } catch (_) {}
       }
 
-      let rawBodyString = "";
+      let rawBodyString = typeof resp?.text === "string" ? resp.text : "";
       if (data && data.body) {
         if (typeof data.body === "string") {
           rawBodyString = data.body;
@@ -939,6 +966,9 @@ class BrightDataProvider {
       }
 
       if (data && typeof data === "object") {
+        if (typeof data.status_code === "number" && data.status_code >= 400) {
+          throw new Error(`Bright Data SERP HTTP ${data.status_code}`);
+        }
         const keys = Object.keys(data).join(", ");
         throw new Error(
           `Bright Data returned [${keys}], but no image grid. In Bright Data dashboard → ${this.zone} → Configuration → Data format, select 'Full JSON' and click Save changes.`
@@ -946,12 +976,17 @@ class BrightDataProvider {
       }
     } catch (serpErr) {
       const msg = String(serpErr?.message || "");
+      const errStatus = serpErr?.status || serpErr?.statusCode || 0;
+      if (errStatus === 401 || errStatus === 403 || /\b(?:401|403)\b/.test(msg)) {
+        const code = errStatus === 403 || /\b403\b/.test(msg) ? 403 : 401;
+        throw new Error(`Bright Data authentication failed (HTTP ${code}). Check your API Key and Zone.`);
+      }
       if (
         msg.includes("Full JSON") ||
         msg.includes("API Key") ||
         msg.includes("Bright Data error:") ||
         msg.includes("authentication failed") ||
-        /\b(?:401|403)\b/.test(msg)
+        msg.includes("Request timed out")
       ) {
         throw serpErr;
       }
@@ -967,8 +1002,11 @@ class BrightDataProvider {
         });
 
         if (dResp.status == null || dResp.status === 200) {
-          let list = Array.isArray(dResp.json) ? dResp.json : null;
-          if (!list && typeof dResp.text === "string") {
+          let list = null;
+          try {
+            if (Array.isArray(dResp?.json)) list = dResp.json;
+          } catch (_) {}
+          if (!list && typeof dResp?.text === "string") {
             try {
               list = JSON.parse(dResp.text);
             } catch (_) {}
@@ -2231,6 +2269,7 @@ class BatchImageReviewModal extends Modal {
     const provider = this.plugin.getProvider(providerId);
     const t0 = Date.now();
     rItem.loading = true;
+    rItem.providerId = providerId;
     rItem.loadingProviderId = providerId;
     rItem.error = null;
     rItem.insertError = null;
@@ -2260,7 +2299,8 @@ class BatchImageReviewModal extends Modal {
       rItem.error = safeError(err);
       rItem.included = false;
       rItem.selectedIndices = [];
-      return { cached: false };
+      const fatal = /API Key|authentication failed|Full JSON/i.test(rItem.error);
+      return { cached: false, fatalError: fatal ? rItem.error : null };
     }
   }
 
@@ -2281,14 +2321,16 @@ class BatchImageReviewModal extends Modal {
       let nextIdx = 0;
       let started = 0;
       let completed = 0;
+      let fatalStopError = null;
 
       const worker = async () => {
-        while (!this.isClosed && gen === this.fetchGeneration) {
+        while (!this.isClosed && gen === this.fetchGeneration && !fatalStopError) {
           const i = nextIdx++;
           if (i >= this.reviewItems.length) break;
           const item = this.reviewItems[i];
           started++;
           item.loading = true;
+          item.providerId = engineId;
           item.loadingProviderId = engineId;
           item.error = null;
           item.insertError = null;
@@ -2305,7 +2347,12 @@ class BatchImageReviewModal extends Modal {
           this.updateCard(item);
           if (progressBar) progressBar.value = completed;
 
-          if (!meta?.cached && nextIdx < this.reviewItems.length && !this.isClosed && gen === this.fetchGeneration) {
+          if (meta?.fatalError) {
+            fatalStopError = meta.fatalError;
+            break;
+          }
+
+          if (!meta?.cached && nextIdx < this.reviewItems.length && !this.isClosed && gen === this.fetchGeneration && !fatalStopError) {
             await new Promise((res) => setTimeout(res, delayMs));
           }
         }
@@ -2314,6 +2361,21 @@ class BatchImageReviewModal extends Modal {
       const workers = [];
       for (let w = 0; w < concurrency; w++) workers.push(worker());
       await Promise.all(workers);
+
+      if (fatalStopError && !this.isClosed && gen === this.fetchGeneration) {
+        for (let k = nextIdx; k < this.reviewItems.length; k++) {
+          const rem = this.reviewItems[k];
+          if (rem.loading) {
+            rem.loading = false;
+            rem.loadingProviderId = null;
+            rem.providerId = engineId;
+            rem.error = fatalStopError;
+            rem.included = false;
+            rem.selectedIndices = [];
+            this.updateCard(rem);
+          }
+        }
+      }
     } finally {
       if (gen === this.fetchGeneration) {
         this.isFetchingAll = false;
@@ -2525,12 +2587,14 @@ class BatchImageReviewModal extends Modal {
         queryInput.focus();
         return;
       }
+      const targetEngine = customProviderId || this.currentProviderId;
       r.query = q;
       r.loading = true;
-      r.loadingProviderId = customProviderId || this.currentProviderId;
+      r.providerId = targetEngine;
+      r.loadingProviderId = targetEngine;
       this.updateCard(r);
       await this.fetchSingleItem(r, customProviderId, true);
-      this.updateCard(r);
+      if (!this.isClosed) this.updateCard(r);
     };
 
     queryInput.addEventListener("keydown", (e) => {
@@ -2567,8 +2631,9 @@ class BatchImageReviewModal extends Modal {
       }
     ];
 
+    const cardEngineId = r.loadingProviderId || r.providerId || this.currentProviderId;
     for (const eng of altEngines) {
-      if (eng.id === (r.loadingProviderId || this.currentProviderId)) continue;
+      if (eng.id === cardEngineId) continue;
       const btn = cardActions.createEl("button", {
         cls: "mifm-btn mifm-batch-card-alt",
         text: eng.label
@@ -2651,9 +2716,10 @@ class MedicalImageFinderMobileView extends ItemView {
   updateTargetHeader() {
     if (this.closed || !this.contentEl) return;
     const activeFile = this.plugin.getTargetView()?.file;
-    const targetEl = this.contentEl.querySelector?.(".mifm-target-note");
-    if (activeFile && targetEl) {
+    const targetEl = this.contentEl.querySelector?.(".mifm-header-target-note");
+    if (activeFile && targetEl && !(this.currentTab === "scan" && this.restoredFromMemory)) {
       targetEl.setText(`Target: ${activeFile.basename}`);
+      if (this.currentTab === "scan") this.updateScanContextStatus();
       return;
     }
     this.render();
@@ -2742,6 +2808,14 @@ class MedicalImageFinderMobileView extends ItemView {
 
     const provider = this.plugin.getActiveProvider();
     const providerId = this.plugin.settings?.defaultProvider || "duckduckgo";
+    if (providerId === "brightdata" && !this.plugin.settings?.brightDataApiKey) {
+      new Notice("Bright Data API Key is missing. Add it in Settings → Medical Image Finder Mobile.", 6000);
+      return;
+    }
+    if (providerId === "brave" && !this.plugin.settings?.braveApiKey) {
+      new Notice("Brave API Key is missing. Add it in Settings → Medical Image Finder Mobile.", 6000);
+      return;
+    }
     this.isAutoPiloting = true;
     this.render();
     new Notice(`🚀 Auto-Pilot: Searching ${provider.name} for ${remaining.length} topics...`, 6000);
@@ -2750,6 +2824,7 @@ class MedicalImageFinderMobileView extends ItemView {
       const jobs = [];
       const delayMs = providerId === "duckduckgo" ? 650 : providerId === "brave" ? 1050 : 120;
       let lastWasCached = false;
+      let fatalErrorMsg = "";
 
       for (let i = 0; i < suggestions.length; i++) {
         if (this.closed) return;
@@ -2783,11 +2858,20 @@ class MedicalImageFinderMobileView extends ItemView {
           }
         } catch (err) {
           lastWasCached = false;
+          const errMsg = safeError(err);
           console.warn(`Auto-pilot search failed for "${s.visualConcept}":`, err);
+          if (/API Key|authentication failed|Full JSON/i.test(errMsg)) {
+            fatalErrorMsg = errMsg;
+            break;
+          }
         }
       }
 
       if (this.closed) return;
+      if (fatalErrorMsg && jobs.length === 0) {
+        new Notice(`Auto-Pilot stopped: ${fatalErrorMsg}`, 7000);
+        return;
+      }
       if (jobs.length === 0) {
         new Notice("No images found to insert.");
         return;
@@ -3127,7 +3211,7 @@ class MedicalImageFinderMobileView extends ItemView {
     const activeFile = this.plugin.getTargetView()?.file;
     if (activeFile) {
       const targetRow = header.createDiv({ cls: "mifm-target-row" });
-      targetRow.createDiv({ text: `Target: ${activeFile.basename}`, cls: "mifm-target-note" });
+      targetRow.createDiv({ text: `Target: ${activeFile.basename}`, cls: "mifm-target-note mifm-header-target-note" });
       const openNoteBtn = targetRow.createEl("button", {
         text: "📄 Note",
         cls: "mifm-link-btn mifm-open-note-btn",
@@ -3162,6 +3246,7 @@ class MedicalImageFinderMobileView extends ItemView {
     };
 
     if (this.currentTab === "scan") {
+      this.queryInput = null;
       this.renderScannerView(root);
       return;
     }
@@ -3765,6 +3850,7 @@ class MedicalImageFinderMobileSettingTab extends PluginSettingTab {
           .onChange(async (val) => {
             this.plugin.settings.defaultProvider = val;
             await this.plugin.saveSettings();
+            this.plugin.refreshViews?.();
           });
       });
 
@@ -3862,6 +3948,7 @@ class MedicalImageFinderMobileSettingTab extends PluginSettingTab {
           .onChange(async (val) => {
             this.plugin.settings.brightDataApiKey = val.trim();
             await this.plugin.saveSettings();
+            this.plugin.refreshViews?.();
           });
       })
       .addButton((btn) => {
@@ -3874,7 +3961,7 @@ class MedicalImageFinderMobileSettingTab extends PluginSettingTab {
           btn.setButtonText("Testing…").setDisabled(true);
           try {
             const p = new BrightDataProvider(key, this.plugin.settings.brightDataZone);
-            const res = await p.search("Calot triangle anatomy diagram");
+            const res = normalizeResults(await p.search("Calot triangle anatomy diagram"));
             new Notice(`✅ Bright Data connected (${res.length} images found).`, 5000);
           } catch (err) {
             new Notice(`❌ Bright Data test failed: ${safeError(err)}`, 7000);
@@ -3914,6 +4001,7 @@ class MedicalImageFinderMobileSettingTab extends PluginSettingTab {
           .onChange(async (val) => {
             this.plugin.settings.braveApiKey = val.trim();
             await this.plugin.saveSettings();
+            this.plugin.refreshViews?.();
           });
       })
       .addButton((btn) => {
@@ -3926,7 +4014,7 @@ class MedicalImageFinderMobileSettingTab extends PluginSettingTab {
           btn.setButtonText("Testing…").setDisabled(true);
           try {
             const p = new BraveProvider(key);
-            const res = await p.search("Calot triangle anatomy diagram");
+            const res = normalizeResults(await p.search("Calot triangle anatomy diagram"));
             new Notice(`✅ Brave connected (${res.length} images found).`, 5000);
           } catch (err) {
             new Notice(`❌ Brave test failed: ${safeError(err)}`, 7000);
@@ -4201,6 +4289,14 @@ class MedicalImageFinderMobilePlugin extends Plugin {
       await pending;
     } catch (err) {
       new Notice(`Settings could not be saved: ${safeError(err)}`);
+    }
+  }
+
+  refreshViews() {
+    if (this.disposed) return;
+    const leaves = this.app?.workspace?.getLeavesOfType?.(VIEW_TYPE_MIFM) || [];
+    for (const leaf of leaves) {
+      if (typeof leaf.view?.render === "function") leaf.view.render();
     }
   }
 
