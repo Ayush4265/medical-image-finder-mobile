@@ -1,7 +1,7 @@
 {
   "id": "medical-image-finder-mobile",
   "name": "Medical Image Finder Mobile",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "minAppVersion": "1.5.0",
   "description": "Mobile-ready (iPadOS & Android) medical image finder using DuckDuckGo, Bright Data Google Images, Brave Images, AI Visual Scanner, and point-level insertion.",
   "author": "Ayush4265",

@@ -1,6 +1,6 @@
 {
   "name": "medical-image-finder-mobile",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "Mobile-ready (iPadOS & Android) medical image finder for Obsidian using DuckDuckGo, Bright Data Google Images, Brave Images, AI Visual Scanner, and point-level insertion.",
   "main": "main.js",
   "scripts": {

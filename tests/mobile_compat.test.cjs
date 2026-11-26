@@ -67,10 +67,11 @@ test("manifest.json declares mobile compatibility (isDesktopOnly: false)", () =>
   assert.ok(manifest.minAppVersion);
 });
 
-test("styles.css avoids !important and :has() for Obsidian CSS lint compliance", () => {
+test("styles.css avoids !important, :has(), and scrollbar-width/scrollbar-color for Obsidian CSS lint compliance", () => {
   const css = fs.readFileSync(path.join(PLUGIN_DIR, "styles.css"), "utf8");
   assert.doesNotMatch(css, /!important/i);
   assert.doesNotMatch(css, /:has\s*\(/i);
+  assert.doesNotMatch(css, /\bscrollbar-(?:width|color)\b/i);
 });
 
 test("main.js has zero Node.js, Electron, Buffer, or desktop-only polling dependencies", () => {

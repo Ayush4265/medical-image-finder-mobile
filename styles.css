@@ -281,6 +281,15 @@
   pointer-events: none;
 }
 
+.mifm-thumb-overlay:empty {
+  display: none;
+}
+
+.mifm-thumb-overlay.is-lowres {
+  background: rgba(185, 28, 28, 0.9);
+  color: #fff;
+}
+
 .mifm-card-body {
   padding: 10px;
   display: flex;
@@ -571,6 +580,7 @@
 }
 
 .mifm-inline-thumb-card {
+  position: relative;
   flex: 0 0 120px;
   width: 120px;
   display: flex;
@@ -580,6 +590,14 @@
   overflow: hidden;
   background: var(--background-secondary);
   scroll-snap-align: start;
+}
+
+.mifm-inline-thumb-card .mifm-thumb-overlay {
+  top: 4px;
+  right: 4px;
+  bottom: auto;
+  font-size: 9px;
+  padding: 1px 4px;
 }
 
 .mifm-inline-thumb-img {
@@ -644,11 +662,117 @@
   border: 1px solid var(--interactive-accent);
 }
 
+/* Partial-Note Scope & Scanner Filter Pills */
+.mifm-scan-scope-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.mifm-scan-scope-select {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 12px;
+}
+
+.mifm-scope-custom-inputs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.mifm-scope-line-input {
+  width: 72px;
+  padding: 4px 6px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 12px;
+}
+
+.mifm-scope-badge-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.mifm-scope-pill {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--interactive-accent);
+  background: var(--background-primary);
+  border: 1px solid var(--interactive-accent);
+  border-radius: var(--radius-s);
+  padding: 2px 8px;
+}
+
+.mifm-scan-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 6px 0;
+}
+
+.mifm-scan-filter-bar .mifm-filter-pill {
+  font-size: 11px;
+  padding: 3px 9px;
+}
+
 /* Preview & Import Modals */
+body .modal-container .modal.mifm-preview-modal-window {
+  width: min(980px, 94vw);
+  max-width: 980px;
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+}
+
+body .modal.mifm-preview-modal-window .modal-content.mifm-preview-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: hidden;
+  min-height: 0;
+}
+
 .mifm-preview-modal {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.mifm-preview-nav-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mifm-preview-nav-bar .mifm-preview-zoom-btn {
+  margin-left: auto;
+}
+
+.mifm-preview-pos,
+.mifm-preview-nav-counter {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  min-width: 48px;
+  text-align: center;
 }
 
 .mifm-import-textarea {
@@ -669,15 +793,44 @@
   align-items: center;
   background: var(--background-secondary);
   border-radius: var(--radius-m);
-  max-height: 55vh;
-  overflow: hidden;
-  padding: 6px;
+  max-height: 62vh;
+  overflow: auto;
+  padding: 8px;
+  cursor: zoom-in;
+}
+
+.mifm-modal-img-container.is-zoomed {
+  justify-content: flex-start;
+  align-items: flex-start;
+  cursor: zoom-out;
 }
 
 .mifm-modal-img {
   max-width: 100%;
-  max-height: 52vh;
+  max-height: 60vh;
   object-fit: contain;
+  display: block;
+}
+
+.mifm-modal-img.is-zoomed {
+  max-width: none;
+  max-height: none;
+  width: auto;
+  height: auto;
+  min-width: 140%;
+}
+
+.mifm-modal-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mifm-badge.mifm-badge-lowres {
+  background: rgba(185, 28, 28, 0.14);
+  color: var(--text-error);
+  border: 1px solid rgba(185, 28, 28, 0.45);
 }
 
 .mifm-modal-actions {
@@ -705,6 +858,49 @@ body .modal-container .modal.mifm-batch-modal-window .modal-content.mifm-batch-m
   min-height: 0;
   padding: 0;
   overflow: hidden;
+  --mifm-batch-thumb-h: 230px;
+}
+
+body .modal-container .modal.mifm-batch-modal-window .modal-content.mifm-batch-modal.is-size-sm {
+  --mifm-batch-thumb-h: 100px;
+}
+
+body .modal-container .modal.mifm-batch-modal-window .modal-content.mifm-batch-modal.is-size-md {
+  --mifm-batch-thumb-h: 160px;
+}
+
+body .modal-container .modal.mifm-batch-modal-window .modal-content.mifm-batch-modal.is-size-lg {
+  --mifm-batch-thumb-h: 230px;
+}
+
+body .modal-container .modal.mifm-batch-modal-window .modal-content.mifm-batch-modal.is-size-xl {
+  --mifm-batch-thumb-h: 310px;
+}
+
+.mifm-batch-size-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  padding: 2px;
+}
+
+.mifm-batch-size-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 7px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.mifm-batch-size-btn.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
 }
 
 .mifm-batch-top-bar {
@@ -851,9 +1047,14 @@ body .modal-container .modal.mifm-batch-modal-window .modal-content.mifm-batch-m
 
 .mifm-batch-thumb-option {
   position: relative;
-  flex: 0 0 140px;
-  width: 140px;
-  height: 102px;
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 72px;
+  max-width: min(460px, 75vw);
+  height: var(--mifm-batch-thumb-h, 230px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
   border: 2px solid var(--background-modifier-border);
   border-radius: var(--radius-s);
   cursor: pointer;
@@ -869,9 +1070,10 @@ body .modal-container .modal.mifm-batch-modal-window .modal-content.mifm-batch-m
 }
 
 .mifm-batch-thumb-img {
-  width: 100%;
+  width: auto;
+  max-width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
   display: block;
 }
 
@@ -1006,6 +1208,8 @@ body.is-mobile .mifm-query-input,
 body.is-mobile .mifm-batch-card-query-input,
 body.is-mobile .mifm-import-textarea,
 body.is-mobile .mifm-scan-count-select,
+body.is-mobile .mifm-scan-scope-select,
+body.is-mobile .mifm-scope-line-input,
 body.is-mobile .mifm-provider-select,
 body.is-mobile .mifm-batch-provider-select {
   font-size: 16px; /* Prevents iOS WKWebView auto-zoom on focus */
@@ -1016,9 +1220,16 @@ body.is-mobile .mifm-btn-icon,
 body.is-mobile .mifm-tab,
 body.is-mobile .mifm-filter-pill,
 body.is-mobile .mifm-scan-btn,
+body.is-mobile .mifm-scan-scope-select,
 body.is-mobile .mifm-provider-select,
 body.is-mobile .mifm-batch-provider-select {
   min-height: 40px;
+}
+
+body.is-mobile .mifm-batch-size-btn {
+  min-height: 36px;
+  padding: 5px 10px;
+  font-size: 12px;
 }
 
 body.is-mobile .mifm-filter-bar {
@@ -1041,7 +1252,8 @@ body.is-mobile .mifm-thumb-corner-btn {
 }
 
 @media (max-width: 640px) {
-  body .modal-container .modal.mifm-batch-modal-window {
+  body .modal-container .modal.mifm-batch-modal-window,
+  body .modal-container .modal.mifm-preview-modal-window {
     width: 100vw;
     max-width: 100vw;
     height: 92vh;

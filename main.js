@@ -22,6 +22,7 @@ const DEFAULT_SETTINGS = {
   attachmentFolder: "Attachments/MedicalImages",
   defaultImageWidth: 500,
   includeCaption: false,
+  batchPreviewSize: "lg",
   brightDataApiKey: "",
   brightDataZone: "serp_api1",
   braveApiKey: "",
@@ -34,6 +35,13 @@ const DEFAULT_SETTINGS = {
   lastScanResults: null,
   lastScannedNote: ""
 };
+
+const BATCH_SIZE_PRESETS = [
+  { id: "sm", label: "S", title: "Small thumbnails (100px)" },
+  { id: "md", label: "M", title: "Medium thumbnails (160px)" },
+  { id: "lg", label: "L", title: "Large thumbnails (230px)" },
+  { id: "xl", label: "XL", title: "Extra Large thumbnails (310px)" }
+];
 
 const SEARCH_PROVIDERS = [
   { id: "duckduckgo", label: "DuckDuckGo (Free / No Key)", shortLabel: "DUCKDUCKGO" },
@@ -287,11 +295,13 @@ function openExternalUrl(value) {
   return false;
 }
 
-function bindImageFallback(img, fallbackUrl) {
+function bindImageFallback(img, fallbackUrl, isThumbFallback = true) {
   let triedFallback = false;
+  img._usingThumbFallback = false;
   img.onerror = () => {
     if (!triedFallback && fallbackUrl && img.src !== fallbackUrl) {
       triedFallback = true;
+      img._usingThumbFallback = Boolean(isThumbFallback);
       img.src = fallbackUrl;
       return;
     }
@@ -299,6 +309,124 @@ function bindImageFallback(img, fallbackUrl) {
     if (typeof img.addClass === "function") img.addClass("mifm-img-broken");
     else if (img.classList) img.classList.add("mifm-img-broken");
   };
+}
+
+function syncDimensionBadge(badgeEl, width, height, { fullLabel = false } = {}) {
+  if (!badgeEl) return;
+  const lowClass = fullLabel ? "mifm-badge-lowres" : "is-lowres";
+  if (!width || !height) {
+    badgeEl.style.display = "none";
+    return;
+  }
+  badgeEl.style.display = "";
+  if (width < 250 || height < 250) {
+    if (typeof badgeEl.addClass === "function") badgeEl.addClass(lowClass);
+    badgeEl.setText(fullLabel ? `⚠️ Low res (${width}×${height} px)` : `⚠️ ${width}×${height}`);
+  } else {
+    if (typeof badgeEl.removeClass === "function") badgeEl.removeClass(lowClass);
+    badgeEl.setText(fullLabel ? `${width} × ${height} px` : `${width}×${height}`);
+  }
+}
+
+function bindHighResPreview(img, badgeEl, item, options = {}) {
+  const fullUrl = item.imageUrl || item.thumbnailUrl;
+  const thumbUrl = item.thumbnailUrl;
+  const isDistinctThumb = Boolean(thumbUrl && item.imageUrl && thumbUrl !== item.imageUrl);
+  bindImageFallback(img, thumbUrl, isDistinctThumb);
+  syncDimensionBadge(badgeEl, item.width, item.height, options);
+  img.onload = () => {
+    const nw = img.naturalWidth || 0;
+    const nh = img.naturalHeight || 0;
+    if (nw > 0 && nh > 0 && !img._usingThumbFallback) {
+      if (!item.width || !item.height) {
+        item.width = nw;
+        item.height = nh;
+      }
+      syncDimensionBadge(badgeEl, item.width, item.height, options);
+    }
+  };
+  if (fullUrl) img.src = fullUrl;
+}
+
+function extractNoteSections(noteContent) {
+  if (!noteContent || typeof noteContent !== "string") return [];
+  const lines = noteContent.split(/\r?\n/);
+  const sections = [];
+  let inFence = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    const m = line.match(/^(#{1,6})\s+(.*)/);
+    if (m) {
+      const level = m[1].length;
+      const heading = cleanText(m[2]) || m[2].trim();
+      sections.push({
+        heading,
+        level,
+        startLine: i + 1,
+        endLine: lines.length
+      });
+    }
+  }
+  for (let idx = 0; idx < sections.length; idx++) {
+    const cur = sections[idx];
+    for (let j = idx + 1; j < sections.length; j++) {
+      if (sections[j].level <= cur.level) {
+        cur.endLine = sections[j].startLine - 1;
+        break;
+      }
+    }
+  }
+  return sections;
+}
+
+function findEnclosingHeading(lines, line1Based) {
+  const maxIdx = Math.max(0, Math.min((line1Based || 1) - 1, lines.length - 1));
+  for (let i = maxIdx; i >= 0; i--) {
+    const m = (lines[i] || "").match(/^(#{1,6})\s+(.*)/);
+    if (m) return cleanText(m[2]) || m[2].trim();
+  }
+  return "";
+}
+
+function normalizeScanScope(scope, totalLines = Infinity) {
+  if (!scope || typeof scope !== "object" || scope.mode === "full") return null;
+  const maxVal = typeof totalLines === "number" && isFinite(totalLines) && totalLines >= 1 ? totalLines : Infinity;
+  let startLine = parseInt(scope.startLine, 10);
+  let endLine = parseInt(scope.endLine, 10);
+  if (isNaN(startLine) || startLine < 1) startLine = 1;
+  if (maxVal !== Infinity && startLine > maxVal) startLine = maxVal;
+  if (isNaN(endLine) || endLine < startLine) endLine = startLine;
+  if (maxVal !== Infinity && endLine > maxVal) endLine = maxVal;
+  return {
+    mode: scope.mode || "custom",
+    startLine,
+    endLine,
+    label: String(scope.label || `Lines ${startLine}–${endLine}`).trim(),
+    parentHeading: typeof scope.parentHeading === "string" ? scope.parentHeading.trim() : ""
+  };
+}
+
+function prepareScopedLines(noteContent, scope = null) {
+  const allLines = String(noteContent || "").split(/\r?\n/);
+  const totalLines = allLines.length;
+  const normScope = normalizeScanScope(scope, totalLines);
+  const startLine = normScope ? normScope.startLine : 1;
+  const endLine = normScope ? normScope.endLine : totalLines;
+  const scopedLines = allLines.slice(startLine - 1, endLine);
+  let totalImagesFound = 0;
+  for (const l of scopedLines) {
+    totalImagesFound += (l.match(/!\[\[.*?\]\]|!\[.*?\]\(.*?\)/g) || []).length;
+  }
+  const parentHeading = normScope
+    ? normScope.parentHeading || findEnclosingHeading(allLines, startLine)
+    : "";
+  const effectiveScope = normScope ? { ...normScope, parentHeading } : null;
+  return { allLines, totalLines, startLine, endLine, scopedLines, totalImagesFound, scope: effectiveScope };
 }
 
 const knownSecrets = new Set();
@@ -339,6 +467,9 @@ function normalizeSettings(saved) {
   const settings = { ...DEFAULT_SETTINGS, ...(saved && typeof saved === "object" ? saved : {}) };
   if (!["duckduckgo", "brightdata", "brave", "wikimedia"].includes(settings.defaultProvider)) {
     settings.defaultProvider = "duckduckgo";
+  }
+  if (!["sm", "md", "lg", "xl"].includes(settings.batchPreviewSize)) {
+    settings.batchPreviewSize = "lg";
   }
   if (!MEDICAL_VISUAL_FILTERS.some((f) => f.id === settings.defaultFilterMode)) settings.defaultFilterMode = "all";
   if (!["gemini", "offline"].includes(settings.aiBackend)) settings.aiBackend = "gemini";
@@ -773,13 +904,16 @@ class BrightDataProvider {
       );
     }
     const q = query.trim();
-    const targetUrl = `https://www.google.com/search?q=${encodeURIComponent(q)}&tbm=isch&udm=2`;
+    // Keep q= first per Bright Data Google Images guidelines; udm=2 is active Google Images parameter
+    const targetUrl = `https://www.google.com/search?q=${encodeURIComponent(q)}&udm=2`;
+
+    const isGoogleTbn = (u) => typeof u === "string" && /encrypted-tbn\d*\.gstatic\.com\/images/i.test(u);
 
     const unwrapSourceLink = (rawLink) => {
       if (!rawLink || typeof rawLink !== "string") return "";
       try {
         const u = new URL(rawLink, "https://www.google.com");
-        if (u.hostname.includes("google.") && u.pathname === "/url") {
+        if (u.hostname.includes("google.") && (u.pathname === "/url" || u.pathname === "/goto")) {
           const target = u.searchParams.get("q") || u.searchParams.get("url") || "";
           const valid = httpUrl(target);
           if (valid) return valid;
@@ -788,7 +922,29 @@ class BrightDataProvider {
       return httpUrl(rawLink) || rawLink;
     };
 
-    try {
+    const prioritizeHighRes = (mappedList) => {
+      const highRes = [];
+      const fallback = [];
+      for (const item of mappedList) {
+        const lowDims = item.width && item.height && (item.width < 250 || item.height < 250);
+        const lowUri = !item.imageUrl || item.imageUrl.startsWith("data:image/") || isGoogleTbn(item.imageUrl);
+        if (lowDims || lowUri) {
+          fallback.push(item);
+        } else {
+          highRes.push(item);
+        }
+      }
+      return [...highRes, ...fallback].slice(0, 30);
+    };
+
+    const parseSerpPayload = async (useLightJson) => {
+      const bodyPayload = {
+        zone: this.zone,
+        url: targetUrl,
+        format: "json"
+      };
+      if (useLightJson) bodyPayload.data_format = "parsed_light";
+
       const resp = await requestWithTimeout({
         url: "https://api.brightdata.com/request",
         method: "POST",
@@ -796,19 +952,14 @@ class BrightDataProvider {
           Authorization: `Bearer ${this.apiKey}`,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({
-          zone: this.zone,
-          url: targetUrl,
-          format: "json"
-        })
+        body: JSON.stringify(bodyPayload)
       });
 
       const status = resp?.status;
       if (status === 401 || status === 403) {
-        throw new Error(`Bright Data authentication failed (HTTP ${status}). Check your API Key and Zone.`);
-      }
-      if (status != null && status !== 200) {
-        throw new Error(`Bright Data SERP HTTP ${status}`);
+        const authErr = new Error(`Bright Data authentication failed (HTTP ${status}). Check your API Key and Zone.`);
+        authErr.status = status;
+        throw authErr;
       }
 
       let data = null;
@@ -819,6 +970,14 @@ class BrightDataProvider {
         try {
           data = JSON.parse(resp.text);
         } catch (_) {}
+      }
+
+      if (status != null && status !== 200) {
+        const msg = data?.error || data?.message || resp?.text || "";
+        const err = new Error(`Bright Data SERP HTTP ${status}${msg ? `: ${msg}` : ""}`);
+        err.status = status;
+        err.canRetryWithoutLight = status === 400 || status === 422 || /data_format|parsed_light/i.test(String(msg));
+        throw err;
       }
 
       let rawBodyString = typeof resp?.text === "string" ? resp.text : "";
@@ -835,18 +994,61 @@ class BrightDataProvider {
 
       if (data && data.error) {
         const errMsg = typeof data.error === "string" ? data.error : data.error.message || JSON.stringify(data.error);
-        throw new Error(`Bright Data error: ${errMsg}`);
+        const err = new Error(`Bright Data error: ${errMsg}`);
+        err.canRetryWithoutLight = /data_format|parsed_light/i.test(String(errMsg));
+        throw err;
       }
       if (data && data.message && !data.images && !data.images_results && !data.organic) {
-        throw new Error(`Bright Data message: ${data.message}`);
+        const err = new Error(`Bright Data message: ${data.message}`);
+        err.canRetryWithoutLight = /data_format|parsed_light/i.test(String(data.message));
+        throw err;
+      }
+
+      return { data, rawBodyString };
+    };
+
+    try {
+      let parsedResp;
+      try {
+        parsedResp = await parseSerpPayload(true);
+      } catch (firstErr) {
+        if (firstErr?.canRetryWithoutLight) {
+          parsedResp = await parseSerpPayload(false);
+        } else {
+          throw firstErr;
+        }
+      }
+
+      let { data, rawBodyString } = parsedResp;
+
+      if (
+        data &&
+        typeof data === "object" &&
+        !Array.isArray(data) &&
+        !Array.isArray(data.images) &&
+        !Array.isArray(data.images_results) &&
+        (!rawBodyString || !rawBodyString.includes("<"))
+      ) {
+        try {
+          const retryResp = await parseSerpPayload(false);
+          if (retryResp.data && (Array.isArray(retryResp.data.images) || Array.isArray(retryResp.data.images_results) || retryResp.rawBodyString)) {
+            data = retryResp.data;
+            rawBodyString = retryResp.rawBodyString;
+          }
+        } catch (_) {}
       }
 
       if (data && Array.isArray(data.images) && data.images.length > 0) {
-        return data.images.slice(0, 30).map((item) => {
+        const visible = data.images.filter((item) => item && !item.is_hidden && !item.blurred);
+        const pool = (visible.length > 0 ? visible : data.images).slice(0, 100);
+        const mapped = pool.map((item) => {
           const cleanSource = unwrapSourceLink(item.link);
+          const origUrl = httpUrl(item.original_image) || "";
+          const chosenUrl = origUrl || item.image || item.thumbnail;
+          const thumbUrl = item.image || item.thumbnail || chosenUrl;
           let domain = "";
           try {
-            if (item.original_image) domain = new URL(item.original_image).hostname;
+            if (origUrl) domain = new URL(origUrl).hostname;
             else if (cleanSource) domain = new URL(cleanSource).hostname;
           } catch (_) {}
           if (domain.includes("google.") && item.title) {
@@ -858,24 +1060,33 @@ class BrightDataProvider {
           if (item.title && typeof item.title === "string" && title.endsWith(item.title + item.title)) {
             title = title.slice(0, -item.title.length);
           }
+          const origW = Number(item.original_width) > 0 ? Number(item.original_width) : null;
+          const origH = Number(item.original_height) > 0 ? Number(item.original_height) : null;
+          // Do NOT assign thumbnail dimensions (image_width) to a separate full-res original_image
+          const useThumbDims = !origUrl || origUrl === thumbUrl;
+          const width = origW || (useThumbDims && Number(item.image_width) > 0 ? Number(item.image_width) : null);
+          const height = origH || (useThumbDims && Number(item.image_height) > 0 ? Number(item.image_height) : null);
+
           return {
             title,
-            imageUrl: item.original_image || item.image,
-            thumbnailUrl: item.image || item.original_image,
-            sourceUrl: cleanSource || item.original_image || targetUrl,
-            width: item.original_width || item.image_width || null,
-            height: item.original_height || item.image_height || null,
+            imageUrl: chosenUrl,
+            thumbnailUrl: thumbUrl,
+            sourceUrl: cleanSource || origUrl || targetUrl,
+            width,
+            height,
             domain: domain.replace(/^www\./, "")
           };
         });
+        return prioritizeHighRes(mapped);
       }
 
       if (data && Array.isArray(data.images_results) && data.images_results.length > 0) {
-        return data.images_results.slice(0, 30).map((item) => {
+        const mapped = data.images_results.slice(0, 100).map((item) => {
           const cleanSource = unwrapSourceLink(item.link);
+          const origUrl = httpUrl(item.original) || "";
           let domain = "";
           try {
-            if (item.original) domain = new URL(item.original).hostname;
+            if (origUrl) domain = new URL(origUrl).hostname;
             else if (cleanSource) domain = new URL(cleanSource).hostname;
           } catch (_) {}
           if (domain.includes("google.") && item.source) {
@@ -885,14 +1096,15 @@ class BrightDataProvider {
           }
           return {
             title: decodeHtmlEntities(item.title) || q,
-            imageUrl: item.original || item.thumbnail,
-            thumbnailUrl: item.thumbnail || item.original,
-            sourceUrl: cleanSource || item.original || targetUrl,
-            width: item.original_width || null,
-            height: item.original_height || null,
+            imageUrl: origUrl || item.thumbnail,
+            thumbnailUrl: item.thumbnail || origUrl,
+            sourceUrl: cleanSource || origUrl || targetUrl,
+            width: Number(item.original_width) > 0 ? Number(item.original_width) : null,
+            height: Number(item.original_height) > 0 ? Number(item.original_height) : null,
             domain: domain.replace(/^www\./, "")
           };
         });
+        return prioritizeHighRes(mapped);
       }
 
       if (data && Array.isArray(data.organic) && data.organic.length > 0) {
@@ -904,14 +1116,14 @@ class BrightDataProvider {
             try {
               if (cleanSource) domain = new URL(cleanSource).hostname;
             } catch (_) {}
-            const imgUrl = item.image || (Array.isArray(item.images) ? item.images[0] : null);
+            const imgUrl = item.original_image || item.image || (Array.isArray(item.images) ? item.images[0] : null);
             return {
               title: decodeHtmlEntities(item.title) || q,
               imageUrl: imgUrl,
-              thumbnailUrl: imgUrl,
+              thumbnailUrl: item.image || imgUrl,
               sourceUrl: cleanSource || targetUrl,
-              width: null,
-              height: null,
+              width: Number(item.original_width) > 0 ? Number(item.original_width) : null,
+              height: Number(item.original_height) > 0 ? Number(item.original_height) : null,
               domain: domain.replace(/^www\./, "")
             };
           });
@@ -919,10 +1131,10 @@ class BrightDataProvider {
       }
 
       if (Array.isArray(data) && data.length > 0) {
-        return data.slice(0, 30).map((item) => {
+        const mapped = data.slice(0, 100).map((item) => {
           const cleanSource = unwrapSourceLink(item.link || item.url);
           let domain = "";
-          const src = item.original_image || item.image || item.image_url || item.url;
+          const src = httpUrl(item.original_image) || httpUrl(item.image_url) || item.image || item.url;
           try {
             if (cleanSource) domain = new URL(cleanSource).hostname;
           } catch (_) {}
@@ -931,20 +1143,52 @@ class BrightDataProvider {
             imageUrl: src,
             thumbnailUrl: item.image || item.thumbnail || src,
             sourceUrl: cleanSource || targetUrl,
-            width: item.original_width || null,
-            height: item.original_height || null,
+            width: Number(item.original_width) > 0 ? Number(item.original_width) : null,
+            height: Number(item.original_height) > 0 ? Number(item.original_height) : null,
             domain: domain.replace(/^www\./, "")
           };
         });
+        return prioritizeHighRes(mapped);
       }
 
       if (rawBodyString && typeof rawBodyString === "string" && rawBodyString.includes("<")) {
+        const unescapeHtmlUrl = (raw) =>
+          raw
+            .replace(/\\u0026/gi, "&")
+            .replace(/\\x26/gi, "&")
+            .replace(/\\u003d/gi, "=")
+            .replace(/\\\//g, "/");
+
         const foundImages = [];
         const seen = new Set();
-        const re = /"(https?:\/\/encrypted-tbn0\.gstatic\.com\/images\?q=[^"]+)"/g;
+        const pairedRe = /\["(https?:\/\/encrypted-tbn\d*\.gstatic\.com\/images\?q=[^"]+)",(\d+),(\d+)\],\["(https?:\/\/[^"]+)",(\d+),(\d+)\]/g;
+        let pm;
+        while ((pm = pairedRe.exec(rawBodyString)) !== null && foundImages.length < 30) {
+          const thumb = unescapeHtmlUrl(pm[1]);
+          const orig = httpUrl(unescapeHtmlUrl(pm[4]));
+          if (orig && !isGoogleTbn(orig) && !seen.has(orig)) {
+            seen.add(orig);
+            let domain = "";
+            try {
+              domain = new URL(orig).hostname.replace(/^www\./, "");
+            } catch (_) {}
+            foundImages.push({
+              title: q,
+              imageUrl: orig,
+              thumbnailUrl: thumb,
+              sourceUrl: targetUrl,
+              width: Number(pm[6]) || null,
+              height: Number(pm[5]) || null,
+              domain: domain || "google.com"
+            });
+          }
+        }
+        if (foundImages.length > 0) return prioritizeHighRes(foundImages);
+
+        const re = /"(https?:\/\/encrypted-tbn\d*\.gstatic\.com\/images\?q=[^"]+)"/g;
         let m;
         while ((m = re.exec(rawBodyString)) !== null && foundImages.length < 30) {
-          const u = m[1].replace(/\\u0026/g, "&").replace(/\\x26/g, "&");
+          const u = unescapeHtmlUrl(m[1]);
           if (!seen.has(u)) {
             seen.add(u);
             foundImages.push({
@@ -971,7 +1215,7 @@ class BrightDataProvider {
         }
         const keys = Object.keys(data).join(", ");
         throw new Error(
-          `Bright Data returned [${keys}], but no image grid. In Bright Data dashboard → ${this.zone} → Configuration → Data format, select 'Full JSON' and click Save changes.`
+          `Bright Data returned [${keys}], but no image grid. In Bright Data dashboard → ${this.zone} → Configuration → Data format, select 'Light JSON' or 'Full JSON' and click Save changes.`
         );
       }
     } catch (serpErr) {
@@ -983,6 +1227,7 @@ class BrightDataProvider {
       }
       if (
         msg.includes("Full JSON") ||
+        msg.includes("Light JSON") ||
         msg.includes("API Key") ||
         msg.includes("Bright Data error:") ||
         msg.includes("authentication failed") ||
@@ -1036,7 +1281,7 @@ class BrightDataProvider {
     }
 
     throw new Error(
-      `Unexpected Bright Data response format. In Bright Data dashboard → ${this.zone} → Configuration → Data format, select 'Full JSON' and Save changes.`
+      `Unexpected Bright Data response format. In Bright Data dashboard → ${this.zone} → Configuration → Data format, select 'Light JSON' or 'Full JSON' and Save changes.`
     );
   }
 }
@@ -1101,26 +1346,25 @@ class OfflineMedicalScanner {
     ];
   }
 
-  async scanNote(noteTitle, noteContent, maxSuggestions = 20, onProgress = null) {
+  async scanNote(noteTitle, noteContent, maxSuggestions = 20, onProgress = null, scope = null) {
     if (onProgress) onProgress("Running Offline Medical Rules Engine...");
     maxSuggestions = maxSuggestions || 20;
 
-    const allLines = noteContent.split(/\r?\n/);
-    const totalLines = allLines.length;
-    let totalImagesFound = 0;
-    allLines.forEach((l) => {
-      totalImagesFound += (l.match(/!\[\[.*?\]\]|!\[.*?\]\(.*?\)/g) || []).length;
-    });
+    const prepared = prepareScopedLines(noteContent, scope);
+    const { allLines, totalLines, startLine, endLine, totalImagesFound, scope: normScope } = prepared;
 
     const sectionList = [];
-    let currentHeading = "Introduction";
+    let currentHeading = normScope?.parentHeading || "Introduction";
     const lineHeadings = [];
 
     allLines.forEach((line, idx) => {
       const hm = line.match(/^(#{1,6})\s+(.*)$/);
       if (hm) {
         currentHeading = hm[2].replace(/[#*`_]/g, "").trim();
-        sectionList.push({ line: idx + 1, heading: currentHeading });
+        const lineNum = idx + 1;
+        if (lineNum >= startLine && lineNum <= endLine) {
+          sectionList.push({ line: lineNum, heading: currentHeading });
+        }
       }
       lineHeadings.push(currentHeading);
     });
@@ -1129,7 +1373,7 @@ class OfflineMedicalScanner {
     const seenQueries = new Set();
     const rules = OfflineMedicalScanner.CLINICAL_RULES;
 
-    for (let i = 0; i < allLines.length; i++) {
+    for (let i = startLine - 1; i < endLine; i++) {
       if (matchedSuggestions.length >= maxSuggestions * 2) break;
       const lineText = allLines[i];
       if (!lineText || lineText.trim().length < 4) continue;
@@ -1180,25 +1424,28 @@ class OfflineMedicalScanner {
 
     if (matchedSuggestions.length === 0) {
       return {
-        summary: `Offline Medical Rules Engine identified 0 visual opportunities across ${sectionList.length} sections.`,
+        summary: `Offline Medical Rules Engine identified 0 visual opportunities${normScope ? ` in ${normScope.label}` : ` across ${sectionList.length} sections`}.`,
         existingImages: totalImagesFound,
-        suggestions: []
+        suggestions: [],
+        scope: normScope
       };
     }
 
     const sanitized = GeminiScannerService.sanitizeSuggestions(
       {
-        summary: `Offline Medical Rules Engine identified ${matchedSuggestions.length} high-yield visual opportunities across ${sectionList.length} sections.`,
+        summary: `Offline Medical Rules Engine identified ${matchedSuggestions.length} high-yield visual opportunities${normScope ? ` in ${normScope.label}` : ` across ${sectionList.length} sections`}.`,
         suggestions: matchedSuggestions
       },
       totalLines,
       maxSuggestions
     );
 
+    const scopedResult = GeminiScannerService.filterSuggestionsByScope(sanitized, normScope, totalLines);
     return {
-      summary: sanitized.summary,
+      summary: scopedResult.summary,
       existingImages: totalImagesFound,
-      suggestions: sanitized.suggestions
+      suggestions: scopedResult.suggestions,
+      scope: scopedResult.scope || normScope
     };
   }
 }
@@ -1558,7 +1805,49 @@ class GeminiScannerService {
     );
   }
 
-  static parseGeminiResponse(rawText, maxLines = Infinity, maxSuggestions = 25) {
+  static filterSuggestionsByScope(parsed, scope = null, maxLines = Infinity) {
+    if (!parsed || !Array.isArray(parsed.suggestions)) return parsed;
+    const normScope = normalizeScanScope(scope, maxLines);
+    if (!normScope) return parsed;
+
+    const minAllowed = normScope.startLine - 1;
+    const maxAllowed = normScope.endLine + 1;
+    const kept = [];
+    let filteredOutCount = 0;
+
+    for (const s of parsed.suggestions) {
+      if (!s) continue;
+      if (s.line >= minAllowed && s.line <= maxAllowed) {
+        kept.push({
+          ...s,
+          line: Math.max(normScope.startLine, Math.min(normScope.endLine, s.line))
+        });
+      } else {
+        filteredOutCount++;
+      }
+    }
+
+    if (kept.length === 0) {
+      throw new Error(
+        `All ${parsed.suggestions.length} AI suggestion(s) fell outside your scan scope (Lines ${normScope.startLine}–${normScope.endLine}). Ensure AI uses [L${normScope.startLine}]–[L${normScope.endLine}] line numbers.`
+      );
+    }
+
+    kept.sort((a, b) => a.line - b.line);
+    return {
+      ...parsed,
+      suggestions: kept,
+      scope: normScope,
+      filteredOutCount
+    };
+  }
+
+  static parseGeminiResponse(rawText, maxLines = Infinity, maxSuggestions = 25, scope = null) {
+    const baseResult = GeminiScannerService._parseUnscopedResponse(rawText, maxLines, maxSuggestions);
+    return GeminiScannerService.filterSuggestionsByScope(baseResult, scope, maxLines);
+  }
+
+  static _parseUnscopedResponse(rawText, maxLines = Infinity, maxSuggestions = 25) {
     if (!rawText || !rawText.trim()) {
       throw new Error("Input is empty. Copy the AI response and try again.");
     }
@@ -1650,15 +1939,22 @@ class GeminiScannerService {
     throw new Error("Could not find visual suggestions in the AI response. Please ensure you copied the complete output.");
   }
 
-  static buildPrompt(noteTitle, noteContent, targetCount = 25) {
-    const allLines = noteContent.split(/\r?\n/);
-    const totalLines = allLines.length;
-    let totalImagesFound = 0;
-    allLines.forEach((l) => {
-      totalImagesFound += (l.match(/!\[\[.*?\]\]|!\[.*?\]\(.*?\)/g) || []).length;
-    });
-
-    const fullNumberedText = allLines.map((l, i) => `[L${i + 1}] ${l}`).join("\n");
+  static buildPrompt(noteTitle, noteContent, targetCount = 25, scope = null) {
+    const prepared = prepareScopedLines(noteContent, scope);
+    const { totalLines, startLine, endLine, scopedLines, totalImagesFound, scope: normScope } = prepared;
+    const fullNumberedText = scopedLines.map((l, i) => `[L${startLine + i}] ${l}`).join("\n");
+    const taskScopeText = normScope
+      ? `Read ONLY the SELECTED SECTION below (Lines ${normScope.startLine}–${normScope.endLine} of "${noteTitle}"${normScope.parentHeading ? ` under "${normScope.parentHeading}"` : ""}).`
+      : `Read the ENTIRE, UNABRIDGED medical note below from top to bottom.`;
+    const scopeRulesBlock = normScope
+      ? `- SCAN SCOPE LOCKED (PARTIAL NOTE): Analyze ONLY lines [L${normScope.startLine}] through [L${normScope.endLine}] (${normScope.label}). Every returned "line" MUST be an integer between ${normScope.startLine} and ${normScope.endLine}. Do NOT output suggestions outside this range.`
+      : `- Scan the ENTIRE note thoroughly. Do NOT skip any section.`;
+    const excerptBanner = normScope
+      ? `SELECTED PARTIAL NOTE EXCERPT (${normScope.label}: Lines ${startLine}–${endLine} of ${totalLines}, preserving original line numbers):`
+      : `COMPLETE UNABRIDGED NOTE:`;
+    const lineMeta = normScope
+      ? `Total Lines: ${scopedLines.length} selected (Lines ${startLine}–${endLine} of ${totalLines} total)${normScope.parentHeading ? `\nParent Section Context: "${normScope.parentHeading}"` : ""}`
+      : `Total Lines: ${totalLines}`;
 
     return `You are an expert MBBS medical educator with deep knowledge of:
 - Clinical Surgery (Bailey & Love, SRB, Schwartz)
@@ -1668,7 +1964,7 @@ class GeminiScannerService {
 - Radiology (pathognomonic signs, pattern recognition)
 - Physiology & Pharmacology & Embryology
 
-Your task: Read the ENTIRE, UNABRIDGED medical note below from top to bottom.
+Your task: ${taskScopeText}
 Identify every significant location where a medical student needs a visual image for exam/viva retention.
 
 VISUAL CATEGORIES:
@@ -1680,9 +1976,10 @@ VISUAL CATEGORIES:
 6. embryology: Developmental rotations, descent, physiological curves
 
 STRICT RULES:
+${scopeRulesBlock}
 - Use the [L<number>] prefix to report the EXACT line number where each visual opportunity exists.
 - Keep recommendedQuery SIMPLE, CLEAN, and CONCISE (strictly 3 to 5 clear keywords, e.g. 'Whipple procedure labeled diagram', 'Double bubble sign X-ray', 'Triangle of doom diagram').
-- Recommend clean textbook illustrations, anatomical diagrams, and pathognomonic spotters optimized for DuckDuckGo image search.
+- Recommend clean textbook illustrations, anatomical diagrams, and pathognomonic spotters optimized for medical image search.
 - visualType must be one of: "diagram", "radiology", "histology", "clinical", "criteria", "embryology".
 - Provide at most ${targetCount} high-yield suggestions, ordered chronologically by ascending line number [L<number>].
 
@@ -1693,7 +1990,7 @@ PREFERRED OUTPUT FORMAT (valid JSON):
   "suggestions": [
     {
       "heading": "Section heading from note",
-      "line": 42,
+      "line": ${startLine},
       "visualConcept": "Specific image title",
       "visualType": "diagram",
       "rationale": "Why this visual is high-yield (2 sentences)",
@@ -1704,37 +2001,37 @@ PREFERRED OUTPUT FORMAT (valid JSON):
 \`\`\`
 
 Note Title: "${noteTitle}"
-Total Lines: ${totalLines}
+${lineMeta}
 Existing Images: ${totalImagesFound}
 
-COMPLETE UNABRIDGED NOTE:
+${excerptBanner}
 ${fullNumberedText}`;
   }
 
-  async scanNote(noteTitle, noteContent, maxSuggestions = 20, onProgress = null) {
+  async scanNote(noteTitle, noteContent, maxSuggestions = 20, onProgress = null, scope = null) {
     if (!this.apiKey) {
       throw new Error("Gemini API key is missing. Enter it in Settings → Medical Image Finder Mobile, or use Offline / Copy & Paste AI Scanner.");
     }
 
-    let submittedContent = noteContent;
+    const prepared = prepareScopedLines(noteContent, scope);
+    const { totalLines, startLine, endLine, scopedLines, totalImagesFound, scope: normScope } = prepared;
+
+    let fullNumberedText = scopedLines.map((l, i) => `[L${startLine + i}] ${l}`).join("\n");
     let truncationNote = "";
-    if (submittedContent.length > 60000) {
-      submittedContent = submittedContent.slice(0, 60000);
+    if (fullNumberedText.length > 60000) {
+      fullNumberedText = fullNumberedText.slice(0, 60000);
       truncationNote = " (scanned first 60,000 characters)";
     }
 
-    const allLines = submittedContent.split(/\r?\n/);
-    const totalLines = allLines.length;
-    let totalImagesFound = 0;
-    allLines.forEach((l) => {
-      totalImagesFound += (l.match(/!\[\[.*?\]\]|!\[.*?\]\(.*?\)/g) || []).length;
-    });
+    if (onProgress) {
+      onProgress(`Analyzing ${normScope ? normScope.label : "note"} (${scopedLines.length} lines) with Gemini...`);
+    }
 
-    if (onProgress) onProgress(`Analyzing note (${totalLines} lines) with Gemini...`);
-
-    const fullNumberedText = allLines.map((l, i) => `[L${i + 1}] ${l}`).join("\n");
-    const systemPrompt = `You are an expert MBBS medical educator. Find visual opportunities across note. Line prefix is [L<number>]. Keep recommendedQuery SIMPLE and CONCISE (3 to 5 keywords). Output valid JSON with summary and suggestions array containing heading, line, visualConcept, visualType, rationale, recommendedQuery strictly ordered by ascending line number. Return at most ${maxSuggestions} highest-yield suggestions.`;
-    const userPrompt = `Note Title: "${noteTitle}"\nTotal Lines: ${totalLines}\nExisting Images: ${totalImagesFound}\n\n${fullNumberedText}`;
+    const scopeDirective = normScope
+      ? ` SCAN SCOPE: Analyze ONLY lines [L${normScope.startLine}] to [L${normScope.endLine}] (${normScope.label}). Every suggestion line MUST be between ${normScope.startLine} and ${normScope.endLine}.`
+      : "";
+    const systemPrompt = `You are an expert MBBS medical educator. Find visual opportunities across note.${scopeDirective} Line prefix is [L<number>]. Keep recommendedQuery SIMPLE and CONCISE (3 to 5 keywords). Output valid JSON with summary and suggestions array containing heading, line, visualConcept, visualType, rationale, recommendedQuery strictly ordered by ascending line number. Return at most ${maxSuggestions} highest-yield suggestions.`;
+    const userPrompt = `Note Title: "${noteTitle}"\nTotal Lines: ${normScope ? `${startLine}-${endLine} of ${totalLines}` : totalLines}\nExisting Images: ${totalImagesFound}\n\n${fullNumberedText}`;
 
     const uniqueModels = Array.from(
       new Set([this.model, "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-2.5-pro"].filter(Boolean))
@@ -1827,6 +2124,7 @@ ${fullNumberedText}`;
     }
 
     const sanitized = GeminiScannerService.sanitizeSuggestions(parsedJson, totalLines, maxSuggestions);
+    const scopedResult = GeminiScannerService.filterSuggestionsByScope(sanitized, normScope, totalLines);
 
     if (successfulModel && successfulModel !== this.model && this.plugin?.settings) {
       this.plugin.settings.geminiModel = successfulModel;
@@ -1834,9 +2132,11 @@ ${fullNumberedText}`;
     }
 
     return {
-      summary: (sanitized.summary || `Scanned note (${totalLines} lines) with Gemini.`) + truncationNote,
+      summary: (scopedResult.summary || `Scanned note (${totalLines} lines) with Gemini.`) + truncationNote,
       existingImages: totalImagesFound,
-      suggestions: sanitized.suggestions
+      suggestions: scopedResult.suggestions,
+      scope: scopedResult.scope || normScope,
+      filteredOutCount: scopedResult.filteredOutCount || 0
     };
   }
 }
@@ -1905,10 +2205,15 @@ class AiResponseImportModal extends Modal {
       try {
         const lineCount = this.view.scanContext?.editor?.lineCount() || Infinity;
         const targetCount = this.plugin.settings.geminiMaxSuggestions || 25;
-        const parsed = GeminiScannerService.parseGeminiResponse(raw, lineCount, targetCount);
+        const importScope = typeof this.view?.getImportScope === "function" ? this.view.getImportScope() : null;
+        const parsed = GeminiScannerService.parseGeminiResponse(raw, lineCount, targetCount, importScope);
         this.view.applyScanResults(parsed, raw);
         this.close();
-        new Notice(`Imported ${parsed.suggestions.length} visual suggestions!`);
+        if (parsed.filteredOutCount > 0) {
+          new Notice(`Imported ${parsed.suggestions.length} visual suggestions (filtered ${parsed.filteredOutCount} outside scope).`, 6000);
+        } else {
+          new Notice(`Imported ${parsed.suggestions.length} visual suggestions!`);
+        }
       } catch (err) {
         new Notice(`Import failed: ${safeError(err)}`);
       }
@@ -1924,40 +2229,144 @@ class AiResponseImportModal extends Modal {
 }
 
 class ImagePreviewModal extends Modal {
-  constructor(app, plugin, item, view = null) {
+  constructor(app, plugin, item, view = null, previewContext = null) {
     super(app);
     this.plugin = plugin;
     this.item = item;
     this.view = view;
+    this.previewContext = previewContext;
+    this.currentIndex = previewContext && Number.isInteger(previewContext.currentIndex) ? previewContext.currentIndex : 0;
+    this.isZoomed = false;
+    this._keydownHandler = null;
   }
 
   onOpen() {
+    if (this.modalEl && typeof this.modalEl.addClass === "function") {
+      this.modalEl.addClass("mifm-preview-modal-window");
+    }
+    this.renderPreview();
+
+    if (typeof document !== "undefined" && document.addEventListener) {
+      this._keydownHandler = (e) => {
+        if (!e) return;
+        const items = this.previewContext?.items;
+        if (e.key === "ArrowLeft" && Array.isArray(items) && items.length > 1 && this.currentIndex > 0) {
+          e.preventDefault();
+          this.navigateBy(-1);
+        } else if (e.key === "ArrowRight" && Array.isArray(items) && items.length > 1 && this.currentIndex < items.length - 1) {
+          e.preventDefault();
+          this.navigateBy(1);
+        } else if ((e.key === "z" || e.key === "Z") && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          this.toggleZoom();
+        } else if (e.key === " " && typeof this.previewContext?.onBatchToggle === "function") {
+          e.preventDefault();
+          this.previewContext.onBatchToggle(this.currentIndex);
+          this.renderPreview();
+        }
+      };
+      document.addEventListener("keydown", this._keydownHandler);
+    }
+  }
+
+  navigateBy(delta) {
+    const items = this.previewContext?.items;
+    if (!Array.isArray(items) || items.length === 0) return;
+    const nextIdx = Math.max(0, Math.min(items.length - 1, this.currentIndex + delta));
+    if (nextIdx === this.currentIndex) return;
+    this.currentIndex = nextIdx;
+    this.item = items[nextIdx];
+    this.isZoomed = false;
+    this.renderPreview();
+  }
+
+  toggleZoom() {
+    this.isZoomed = !this.isZoomed;
+    const imgContainer = this.contentEl.querySelector(".mifm-modal-img-container");
+    const img = this.contentEl.querySelector(".mifm-modal-img");
+    const zoomBtn = this.contentEl.querySelector(".mifm-preview-zoom-btn");
+    if (imgContainer) {
+      if (this.isZoomed) imgContainer.addClass("is-zoomed");
+      else imgContainer.removeClass("is-zoomed");
+    }
+    if (img) {
+      if (this.isZoomed) img.addClass("is-zoomed");
+      else img.removeClass("is-zoomed");
+    }
+    if (zoomBtn) {
+      zoomBtn.setText(this.isZoomed ? "🔍 Fit screen" : "🔍 2× Zoom");
+    }
+  }
+
+  renderPreview() {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("mifm-preview-modal");
-    if (this.modalEl) this.modalEl.addClass("mifm-modal-window");
 
     this.titleEl.setText(this.item.title || "Medical Image Preview");
 
-    const imgContainer = contentEl.createDiv({ cls: "mifm-modal-img-container" });
+    const items = Array.isArray(this.previewContext?.items) ? this.previewContext.items : null;
+    if (items && items.length > 1) {
+      const navBar = contentEl.createDiv({ cls: "mifm-preview-nav-bar" });
+      const prevBtn = navBar.createEl("button", { text: "← Prev", cls: "mifm-btn mifm-preview-nav-btn" });
+      prevBtn.disabled = this.currentIndex <= 0;
+      prevBtn.onclick = () => this.navigateBy(-1);
+
+      navBar.createSpan({
+        text: `Image ${this.currentIndex + 1} of ${items.length}`,
+        cls: "mifm-preview-nav-counter"
+      });
+
+      const nextBtn = navBar.createEl("button", { text: "Next →", cls: "mifm-btn mifm-preview-nav-btn" });
+      nextBtn.disabled = this.currentIndex >= items.length - 1;
+      nextBtn.onclick = () => this.navigateBy(1);
+    }
+
+    const imgContainer = contentEl.createDiv({
+      cls: `mifm-modal-img-container ${this.isZoomed ? "is-zoomed" : ""}`
+    });
     const img = imgContainer.createEl("img", {
-      cls: "mifm-modal-img",
+      cls: `mifm-modal-img ${this.isZoomed ? "is-zoomed" : ""}`,
       attr: {
         src: this.item.imageUrl || this.item.thumbnailUrl,
-        alt: this.item.title
+        alt: this.item.title || "Medical image"
       }
     });
-    bindImageFallback(img, this.item.thumbnailUrl);
+    imgContainer.onclick = (e) => {
+      e?.stopPropagation?.();
+      this.toggleZoom();
+    };
 
     const details = contentEl.createDiv({ cls: "mifm-card-meta" });
-    if (this.item.width && this.item.height) {
-      details.createSpan({ text: `${this.item.width} × ${this.item.height} px`, cls: "mifm-badge" });
-    }
+    const dimBadge = details.createSpan({
+      text: this.item.width && this.item.height ? `${this.item.width} × ${this.item.height} px` : "",
+      cls: "mifm-badge"
+    });
+    bindHighResPreview(img, dimBadge, this.item, { fullLabel: true });
+
     if (this.item.domain) {
       details.createSpan({ text: `Source: ${this.item.domain}`, cls: "mifm-domain" });
     }
 
     const actions = contentEl.createDiv({ cls: "mifm-modal-actions" });
+
+    const zoomBtn = actions.createEl("button", {
+      text: this.isZoomed ? "🔍 Fit screen" : "🔍 2× Zoom",
+      cls: "mifm-btn mifm-preview-zoom-btn"
+    });
+    zoomBtn.onclick = () => this.toggleZoom();
+
+    if (typeof this.previewContext?.onBatchToggle === "function") {
+      const isSelected = Boolean(this.previewContext.isIndexSelected?.(this.currentIndex));
+      const batchToggleBtn = actions.createEl("button", {
+        text: isSelected ? "✓ Included in Batch" : "+ Select for Batch",
+        cls: `mifm-btn ${isSelected ? "mifm-btn-copy" : ""}`
+      });
+      batchToggleBtn.onclick = () => {
+        this.previewContext.onBatchToggle(this.currentIndex);
+        this.renderPreview();
+      };
+    }
 
     const insertBtn = actions.createEl("button", {
       text: "📥 Save & insert into note",
@@ -2022,6 +2431,10 @@ class ImagePreviewModal extends Modal {
   }
 
   onClose() {
+    if (this._keydownHandler && typeof document !== "undefined" && document.removeEventListener) {
+      document.removeEventListener("keydown", this._keydownHandler);
+      this._keydownHandler = null;
+    }
     this.contentEl.empty();
   }
 }
@@ -2033,6 +2446,7 @@ class BatchImageReviewModal extends Modal {
     this.view = view;
     this.suggestions = (view.scanResults?.suggestions || []).map((s, idx) => ({ ...s, _idx: idx }));
     this.scanContext = view.scanContext;
+    this.scanScope = view.scanResults?.scope || null;
     this.reviewItems = [];
     this.isInserting = false;
     this.isFetchingAll = false;
@@ -2040,6 +2454,9 @@ class BatchImageReviewModal extends Modal {
     this.insertBtn = null;
     this.selectionCount = null;
     this.currentProviderId = plugin.settings?.defaultProvider || "duckduckgo";
+    this.previewSize = ["sm", "md", "lg", "xl"].includes(plugin.settings?.batchPreviewSize)
+      ? plugin.settings.batchPreviewSize
+      : "lg";
   }
 
   getProviderDisplayName(id) {
@@ -2054,6 +2471,50 @@ class BatchImageReviewModal extends Modal {
       default:
         return "DuckDuckGo";
     }
+  }
+
+  applyPreviewSizeClass() {
+    if (!this.contentEl) return;
+    for (const preset of BATCH_SIZE_PRESETS) {
+      if (typeof this.contentEl.removeClass === "function") this.contentEl.removeClass(`is-size-${preset.id}`);
+    }
+    if (typeof this.contentEl.addClass === "function") this.contentEl.addClass(`is-size-${this.previewSize}`);
+  }
+
+  toggleCandidateSelection(r, cIdx) {
+    r.insertError = null;
+    if (!Array.isArray(r.selectedIndices)) {
+      r.selectedIndices = r.selectedIdx != null && r.included ? [r.selectedIdx] : [];
+    }
+    const idxInSelected = r.selectedIndices.indexOf(cIdx);
+    if (idxInSelected >= 0) {
+      r.selectedIndices.splice(idxInSelected, 1);
+    } else {
+      r.selectedIndices.push(cIdx);
+      r.selectedIndices.sort((a, b) => a - b);
+    }
+    r.selectedIdx = r.selectedIndices.length > 0 ? r.selectedIndices[0] : 0;
+    r.included = r.selectedIndices.length > 0;
+  }
+
+  syncCardSelectionUI(card, r, cb, badge) {
+    const s = r.suggestion;
+    if (cb) cb.checked = r.included;
+    const thumbs = card.querySelectorAll(".mifm-batch-thumb-option");
+    thumbs.forEach((optEl, cIdx) => {
+      const isSelected = r.included && Array.isArray(r.selectedIndices) && r.selectedIndices.includes(cIdx);
+      if (isSelected) optEl.addClass("is-selected");
+      else optEl.removeClass("is-selected");
+      const lbl = optEl.querySelector(".mifm-batch-choice-label");
+      if (lbl) lbl.setText(isSelected ? `✓ #${cIdx + 1}` : `#${cIdx + 1}`);
+    });
+    if (badge) {
+      const selCount = r.included && Array.isArray(r.selectedIndices) ? r.selectedIndices.length : 0;
+      const countText = r.items.length > 0 ? ` • ${r.items.length} opts` : "";
+      const selText = selCount > 1 ? ` (${selCount})` : "";
+      badge.setText(`${s.visualType || "diagram"}${countText}${selText}`);
+    }
+    this.updateFooter();
   }
 
   updateFooter() {
@@ -2079,6 +2540,7 @@ class BatchImageReviewModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("mifm-batch-modal");
+    this.applyPreviewSizeClass();
     if (this.modalEl) this.modalEl.addClass("mifm-batch-modal-window");
 
     this.titleEl.setText("⚡ Fast Batch Image Review");
@@ -2089,8 +2551,9 @@ class BatchImageReviewModal extends Modal {
     }
 
     const topBar = contentEl.createDiv({ cls: "mifm-batch-top-bar" });
+    const scopeHint = this.scanScope ? ` [Scoped: ${this.scanScope.label}]` : "";
     const desc = topBar.createEl("p", {
-      text: `Reviewing ${this.suggestions.length} topics. Tap thumbnails to select 1 or more images per topic.`,
+      text: `Reviewing ${this.suggestions.length} topics${scopeHint}. Tap to select 1 or more • Tap 🔍 for large preview.`,
       cls: "mifm-scan-hero-desc"
     });
     desc.style.margin = "0 0 6px 0";
@@ -2122,10 +2585,37 @@ class BatchImageReviewModal extends Modal {
       this.fetchAllCandidates(progressBar, progressLabel, progressContainer, true);
     };
 
+    const sizeGroup = toolbar.createDiv({ cls: "mifm-batch-size-group" });
+    sizeGroup.createSpan({ cls: "mifm-batch-toolbar-label", text: "🖼️ Size:" });
+    const sizeBtns = new Map();
+    for (const preset of BATCH_SIZE_PRESETS) {
+      const sBtn = sizeGroup.createEl("button", {
+        cls: `mifm-batch-size-btn ${this.previewSize === preset.id ? "is-active" : ""}`,
+        text: preset.label,
+        attr: { type: "button", title: preset.title }
+      });
+      sBtn.onclick = async () => {
+        if (this.previewSize === preset.id) return;
+        this.previewSize = preset.id;
+        this.applyPreviewSizeClass();
+        for (const [id, bEl] of sizeBtns.entries()) {
+          if (id === preset.id) bEl.addClass("is-active");
+          else bEl.removeClass("is-active");
+        }
+        if (this.plugin.settings) {
+          this.plugin.settings.batchPreviewSize = preset.id;
+          if (typeof this.plugin.saveSettings === "function") {
+            await this.plugin.saveSettings({ clearCache: false });
+          }
+        }
+      };
+      sizeBtns.set(preset.id, sBtn);
+    }
+
     const progressContainer = contentEl.createDiv({ cls: "mifm-batch-progress-box" });
     const progressLabel = progressContainer.createDiv({
       cls: "mifm-batch-progress-label",
-      text: `🔍 Searching ${this.getProviderDisplayName(this.currentProviderId)}...`
+      text: `🔍 Searching ${this.getProviderDisplayName(this.currentProviderId)}... (0/${this.suggestions.length})`
     });
     const progressBar = progressContainer.createEl("progress", { cls: "mifm-batch-progress-bar" });
     progressBar.max = this.suggestions.length;
@@ -2195,6 +2685,7 @@ class BatchImageReviewModal extends Modal {
             targetHeading: r.suggestion.heading,
             targetConcept: r.suggestion.visualConcept,
             targetQuery: r.suggestion.recommendedQuery,
+            targetScope: this.scanScope,
             imageItem: {
               ...item,
               targetContext: this.scanContext,
@@ -2202,6 +2693,7 @@ class BatchImageReviewModal extends Modal {
               targetHeading: r.suggestion.heading,
               targetConcept: r.suggestion.visualConcept,
               targetQuery: r.suggestion.recommendedQuery,
+              targetScope: this.scanScope,
               searchOriginSuggestionIndex: r.suggestion._idx
             }
           });
@@ -2212,6 +2704,7 @@ class BatchImageReviewModal extends Modal {
         progressContainer.style.display = "block";
         progressBar.max = jobs.length;
         progressBar.value = 0;
+        progressLabel.setText(`Inserting into note... (0/${jobs.length})`);
         const result = await this.plugin.batchInsertImages(jobs, (cur, total) => {
           progressBar.value = cur;
           progressLabel.setText(`Inserting into note... (${cur}/${total})`);
@@ -2299,7 +2792,7 @@ class BatchImageReviewModal extends Modal {
       rItem.error = safeError(err);
       rItem.included = false;
       rItem.selectedIndices = [];
-      const fatal = /API Key|authentication failed|Full JSON/i.test(rItem.error);
+      const fatal = /API Key|authentication failed|Full JSON|Light JSON/i.test(rItem.error);
       return { cached: false, fatalError: fatal ? rItem.error : null };
     }
   }
@@ -2316,10 +2809,13 @@ class BatchImageReviewModal extends Modal {
       }
 
       const engineId = this.currentProviderId || "duckduckgo";
+      if (progressLabel) {
+        progressLabel.setText(`Searching ${this.getProviderDisplayName(engineId)}... (0/${this.reviewItems.length})`);
+      }
+
       const concurrency = (engineId === "duckduckgo" || engineId === "brave") ? 1 : Math.min(3, this.reviewItems.length);
       const delayMs = engineId === "duckduckgo" ? 650 : engineId === "brave" ? 1050 : 120;
       let nextIdx = 0;
-      let started = 0;
       let completed = 0;
       let fatalStopError = null;
 
@@ -2328,7 +2824,6 @@ class BatchImageReviewModal extends Modal {
           const i = nextIdx++;
           if (i >= this.reviewItems.length) break;
           const item = this.reviewItems[i];
-          started++;
           item.loading = true;
           item.providerId = engineId;
           item.loadingProviderId = engineId;
@@ -2336,9 +2831,6 @@ class BatchImageReviewModal extends Modal {
           item.insertError = null;
           this.updateCard(item);
 
-          if (progressLabel) {
-            progressLabel.setText(`Searching ${this.getProviderDisplayName(engineId)}... (${started}/${this.reviewItems.length})`);
-          }
           const meta = await this.fetchSingleItem(item, engineId, bypassCache);
           if (this.isClosed || gen !== this.fetchGeneration) break;
           if (meta && meta.stale) continue;
@@ -2346,6 +2838,9 @@ class BatchImageReviewModal extends Modal {
           completed++;
           this.updateCard(item);
           if (progressBar) progressBar.value = completed;
+          if (progressLabel) {
+            progressLabel.setText(`Searching ${this.getProviderDisplayName(engineId)}... (${completed}/${this.reviewItems.length})`);
+          }
 
           if (meta?.fatalError) {
             fatalStopError = meta.fatalError;
@@ -2460,7 +2955,6 @@ class BatchImageReviewModal extends Modal {
     }
 
     const optionsRow = card.createDiv({ cls: "mifm-batch-options-row" });
-    // Progressive enhancement for desktop trackpads/mice; mobile uses native touch pan-x
     optionsRow.addEventListener(
       "wheel",
       (evt) => {
@@ -2476,6 +2970,25 @@ class BatchImageReviewModal extends Modal {
       { passive: false }
     );
 
+    const buildPreviewContext = (cIdx) => ({
+      items: r.items.map((cand) => ({
+        ...cand,
+        targetContext: this.scanContext,
+        targetLine: s.line,
+        targetHeading: s.heading,
+        targetConcept: s.visualConcept,
+        targetQuery: s.recommendedQuery,
+        targetScope: this.scanScope,
+        searchOriginSuggestionIndex: s._idx
+      })),
+      currentIndex: cIdx,
+      isIndexSelected: (candIdx) => r.included && Array.isArray(r.selectedIndices) && r.selectedIndices.includes(candIdx),
+      onBatchToggle: (candIdx) => {
+        this.toggleCandidateSelection(r, candIdx);
+        this.syncCardSelectionUI(card, r, cb, badge);
+      }
+    });
+
     r.items.forEach((item, cIdx) => {
       const isSelected = r.included && Array.isArray(r.selectedIndices) && r.selectedIndices.includes(cIdx);
       const optEl = optionsRow.createDiv({
@@ -2486,33 +2999,24 @@ class BatchImageReviewModal extends Modal {
         cls: "mifm-batch-thumb-img",
         attr: { loading: "lazy", decoding: "async" }
       });
-      img.src = item.thumbnailUrl || item.imageUrl;
       img.alt = item.title;
-      bindImageFallback(img, item.imageUrl);
 
       optEl.createSpan({
         cls: "mifm-batch-choice-label",
         text: isSelected ? `✓ #${cIdx + 1}` : `#${cIdx + 1}`
       });
 
-      // Touch-friendly corner action buttons (preview + open source, no double-click needed)
       const cornerBar = optEl.createDiv({ cls: "mifm-thumb-corner-actions" });
       const zoomBtn = cornerBar.createEl("button", {
         cls: "mifm-thumb-corner-btn",
         text: "🔍",
-        attr: { type: "button", "aria-label": "Preview image" }
+        attr: { type: "button", "aria-label": "Large preview" }
       });
       zoomBtn.onclick = (e) => {
         e.stopPropagation();
-        new ImagePreviewModal(this.app, this.plugin, {
-          ...item,
-          targetContext: this.scanContext,
-          targetLine: s.line,
-          targetHeading: s.heading,
-          targetConcept: s.visualConcept,
-          targetQuery: s.recommendedQuery,
-          searchOriginSuggestionIndex: s._idx
-        }, this.view).open();
+        const previewCtx = buildPreviewContext(cIdx);
+        const previewItem = previewCtx.items[cIdx] || { ...item };
+        new ImagePreviewModal(this.app, this.plugin, previewItem, this.view, previewCtx).open();
       };
 
       const srcBtn = cornerBar.createEl("button", {
@@ -2528,37 +3032,16 @@ class BatchImageReviewModal extends Modal {
         }
       };
 
-      if (item.width && item.height) {
-        optEl.createDiv({ cls: "mifm-thumb-overlay", text: `${item.width}×${item.height}` });
-      }
+      const overlay = optEl.createDiv({
+        cls: "mifm-thumb-overlay",
+        text: item.width && item.height ? `${item.width}×${item.height}` : ""
+      });
+      bindHighResPreview(img, overlay, item);
 
       optEl.onclick = (e) => {
         e.stopPropagation();
-        r.insertError = null;
-        if (!Array.isArray(r.selectedIndices)) {
-          r.selectedIndices = r.selectedIdx != null && r.included ? [r.selectedIdx] : [];
-        }
-        const idxInSelected = r.selectedIndices.indexOf(cIdx);
-        if (idxInSelected >= 0) {
-          r.selectedIndices.splice(idxInSelected, 1);
-          optEl.removeClass("is-selected");
-          const lbl = optEl.querySelector(".mifm-batch-choice-label");
-          if (lbl) lbl.setText(`#${cIdx + 1}`);
-        } else {
-          r.selectedIndices.push(cIdx);
-          r.selectedIndices.sort((a, b) => a - b);
-          optEl.addClass("is-selected");
-          const lbl = optEl.querySelector(".mifm-batch-choice-label");
-          if (lbl) lbl.setText(`✓ #${cIdx + 1}`);
-        }
-
-        r.selectedIdx = r.selectedIndices.length > 0 ? r.selectedIndices[0] : 0;
-        r.included = r.selectedIndices.length > 0;
-        cb.checked = r.included;
-
-        const updatedSel = r.included ? r.selectedIndices.length : 0;
-        badge.setText(`${s.visualType || "diagram"} • ${r.items.length} opts${updatedSel > 1 ? ` (${updatedSel})` : ""}`);
-        this.updateFooter();
+        this.toggleCandidateSelection(r, cIdx);
+        this.syncCardSelectionUI(card, r, cb, badge);
       };
     });
 
@@ -2686,6 +3169,15 @@ class MedicalImageFinderMobileView extends ItemView {
     this.searchTargetHeading = null;
     this.searchTargetConcept = null;
     this.searchTargetQuery = null;
+    this.searchTargetScope = null;
+    this.scopeMode = "full";
+    this.selectedSectionKey = "";
+    this.customScopeStart = 1;
+    this.customScopeEnd = 1;
+    this.editorSelectionScope = null;
+    this.pendingScanScope = null;
+    this._lastAutoSelectionKey = "";
+    this.scannerCategoryFilter = "all";
     this.lastActiveScannerIndex = null;
     this.pendingScannerScrollIdx = null;
     this.scannerScrollTop = 0;
@@ -2700,7 +3192,73 @@ class MedicalImageFinderMobileView extends ItemView {
     this.searchTargetHeading = null;
     this.searchTargetConcept = null;
     this.searchTargetQuery = null;
+    this.searchTargetScope = null;
     this.searchOriginSuggestionIndex = null;
+  }
+
+  detectEditorSelectionScope(preferredView = null) {
+    const view = preferredView || this.plugin.getTargetView?.();
+    const editor = view?.editor;
+    if (!editor || typeof editor.getSelection !== "function") return null;
+    const totalLines = typeof editor.lineCount === "function" ? editor.lineCount() : 1;
+    const sel = editor.getSelection();
+    if (!sel || !sel.trim()) return null;
+    const from = editor.getCursor("from");
+    const to = editor.getCursor("to");
+    let startLine = (from?.line ?? 0) + 1;
+    let endLine = (to?.line ?? startLine - 1) + 1;
+    if (to && to.ch === 0 && endLine > startLine) {
+      endLine -= 1;
+    }
+    if (endLine < startLine) [startLine, endLine] = [endLine, startLine];
+    return normalizeScanScope({ mode: "selection", startLine, endLine }, totalLines);
+  }
+
+  getSelectedUiScope(preferredView = null) {
+    const view = preferredView || this.plugin.getTargetView?.();
+    const editor = view?.editor;
+    const content = editor?.getValue?.() || this.scanContext?.content || "";
+    const totalLines = editor?.lineCount?.() || (content ? content.split(/\r?\n/).length : 1);
+
+    if (this.scopeMode === "selection") {
+      const liveSel = this.detectEditorSelectionScope(view);
+      if (liveSel) {
+        this.editorSelectionScope = liveSel;
+        return liveSel;
+      }
+      if (this.editorSelectionScope) {
+        return normalizeScanScope(this.editorSelectionScope, totalLines);
+      }
+      return null;
+    }
+    if (this.scopeMode === "section") {
+      const sections = extractNoteSections(content);
+      const match = sections.find((s) => s.key === this.selectedSectionKey);
+      if (match) {
+        return normalizeScanScope(
+          { mode: "section", startLine: match.startLine, endLine: match.endLine, heading: match.heading },
+          totalLines
+        );
+      }
+      return null;
+    }
+    if (this.scopeMode === "custom") {
+      return normalizeScanScope(
+        { mode: "custom", startLine: this.customScopeStart, endLine: this.customScopeEnd },
+        totalLines
+      );
+    }
+    return null;
+  }
+
+  getImportScope() {
+    if (this.pendingScanScope) return this.pendingScanScope;
+    const uiScope = this.getSelectedUiScope();
+    if (uiScope) return uiScope;
+    if (this.scanResults?.scope && this.scanResults.scope.mode && this.scanResults.scope.mode !== "full") {
+      return this.scanResults.scope;
+    }
+    return null;
   }
 
   syncTargetContentAfterInsert(targetFile = null) {
@@ -2839,12 +3397,14 @@ class MedicalImageFinderMobileView extends ItemView {
           const norm = await this.plugin.searchWithCache(provider, effectiveQuery);
           lastWasCached = Date.now() - t0 < 15;
           if (norm.length > 0) {
+            const activeScope = this.scanResults?.scope || null;
             jobs.push({
               suggestionIndex: i,
               targetLine: s.line,
               targetHeading: s.heading,
               targetConcept: s.visualConcept,
               targetQuery: s.recommendedQuery,
+              targetScope: activeScope,
               imageItem: {
                 ...norm[0],
                 targetContext: this.scanContext,
@@ -2852,6 +3412,7 @@ class MedicalImageFinderMobileView extends ItemView {
                 targetHeading: s.heading,
                 targetConcept: s.visualConcept,
                 targetQuery: s.recommendedQuery,
+                targetScope: activeScope,
                 searchOriginSuggestionIndex: i
               }
             });
@@ -2891,7 +3452,7 @@ class MedicalImageFinderMobileView extends ItemView {
     }
   }
 
-  async copyNotePromptForAiApp() {
+  async copyNotePromptForAiApp(explicitScope = null) {
     let context;
     try {
       context = this.plugin.captureTarget();
@@ -2899,22 +3460,32 @@ class MedicalImageFinderMobileView extends ItemView {
       new Notice(safeError(err));
       return;
     }
-    const { file, content } = context;
+    const { file, content, editor } = context;
     const title = file.basename;
     if (!content || !content.trim()) {
       new Notice("The active note is empty.");
       return;
     }
 
+    const totalLines = editor?.lineCount?.() || content.split(/\r?\n/).length;
+    const targetScope = explicitScope
+      ? normalizeScanScope(explicitScope, totalLines)
+      : this.getSelectedUiScope(context.view);
+    this.pendingScanScope = targetScope;
     this.scanContext = context;
-    this.copiedPromptNote = title;
+    this.copiedPromptNote = targetScope ? `${title} (${targetScope.label})` : title;
     this.waitingForAi = true;
 
     const targetCount = this.plugin.settings.geminiMaxSuggestions || 25;
-    const promptText = GeminiScannerService.buildPrompt(title, content, targetCount);
+    const promptText = GeminiScannerService.buildPrompt(title, content, targetCount, targetScope);
     const copied = await copyToClipboard(promptText);
     if (copied) {
-      new Notice("Copied prompt! Paste into Gemini / ChatGPT / Claude, then return and tap Paste Response.", 7000);
+      new Notice(
+        targetScope
+          ? `Copied scoped prompt (${targetScope.label})! Paste into Gemini / ChatGPT / Claude, then return and tap Paste Response.`
+          : "Copied prompt! Paste into Gemini / ChatGPT / Claude, then return and tap Paste Response.",
+        7000
+      );
     } else {
       new Notice("Clipboard copy failed. Check Obsidian permissions.", 5000);
     }
@@ -2931,9 +3502,12 @@ class MedicalImageFinderMobileView extends ItemView {
       }
       const lineCount = this.scanContext?.editor?.lineCount() || Infinity;
       const targetCount = this.plugin.settings.geminiMaxSuggestions || 25;
-      const parsed = GeminiScannerService.parseGeminiResponse(text, lineCount, targetCount);
+      const importScope = this.getImportScope();
+      const parsed = GeminiScannerService.parseGeminiResponse(text, lineCount, targetCount, importScope);
       await this.applyScanResults(parsed, text);
-      new Notice(`Imported ${parsed.suggestions.length} visual suggestions!`, 5000);
+      const filteredMsg =
+        parsed.filteredOutCount > 0 ? ` (${parsed.filteredOutCount} out-of-scope filtered)` : "";
+      new Notice(`Imported ${parsed.suggestions.length} visual suggestions!${filteredMsg}`, 5000);
     } catch (err) {
       new Notice(`Could not auto-parse clipboard: ${safeError(err)}. Opening paste box...`, 5000);
       new AiResponseImportModal(this.app, this.plugin, this).open();
@@ -2945,6 +3519,8 @@ class MedicalImageFinderMobileView extends ItemView {
     this.restoredFromMemory = false;
     this.scanErrorMessage = "";
     this.waitingForAi = false;
+    this.pendingScanScope = null;
+    this.scannerCategoryFilter = "all";
     this.inlineQuickResults.clear();
     this.inlineLoading.clear();
     this.insertedSuggestionIndices.clear();
@@ -2997,7 +3573,7 @@ class MedicalImageFinderMobileView extends ItemView {
     await this.plugin.app.workspace.revealLeaf(targetView.leaf);
   }
 
-  async executeNoteScan(forceOffline = false) {
+  async executeNoteScan(forceOffline = false, explicitScope = null) {
     if (this.isScanning || this.closed) return;
     let context;
     try {
@@ -3006,12 +3582,18 @@ class MedicalImageFinderMobileView extends ItemView {
       new Notice(safeError(err));
       return;
     }
-    const { file, content } = context;
+    const { file, content, editor } = context;
     const title = file.basename;
     if (!content || !content.trim()) {
       new Notice("The active note is empty.");
       return;
     }
+
+    const totalLines = editor?.lineCount?.() || content.split(/\r?\n/).length;
+    const targetScope = explicitScope
+      ? normalizeScanScope(explicitScope, totalLines)
+      : this.getSelectedUiScope(context.view);
+    this.pendingScanScope = targetScope;
 
     const useOffline = forceOffline || this.plugin.settings.aiBackend === "offline" || !this.plugin.settings.geminiApiKey;
     if (!forceOffline && this.plugin.settings.aiBackend === "gemini" && !this.plugin.settings.geminiApiKey) {
@@ -3022,7 +3604,7 @@ class MedicalImageFinderMobileView extends ItemView {
     const generation = ++this.scanGeneration;
     this.scanContext = context;
     this.scanResults = null;
-    this.scanProgressMsg = "";
+    this.scanProgressMsg = targetScope ? `Scanning ${targetScope.label}...` : "";
     this.inlineQuickResults.clear();
     this.inlineLoading.clear();
     this.isScanning = true;
@@ -3039,9 +3621,11 @@ class MedicalImageFinderMobileView extends ItemView {
           this.scanProgressMsg = msg;
           this.render();
         }
-      });
+      }, targetScope);
       if (this.closed || generation !== this.scanGeneration) return;
       this.scanResults = results;
+      this.pendingScanScope = null;
+      this.scannerCategoryFilter = "all";
       this.restoredFromMemory = false;
       this.insertedSuggestionIndices.clear();
       this.clearSearchLink();
@@ -3055,9 +3639,15 @@ class MedicalImageFinderMobileView extends ItemView {
           if (typeof this.plugin.saveSettings === "function") await this.plugin.saveSettings({ clearCache: false });
         }
       } catch (_) {}
-      new Notice(`Identified ${this.scanResults.suggestions.length} high-yield visual opportunities!`, 5000);
+      new Notice(
+        targetScope
+          ? `Found ${this.scanResults.suggestions.length} visual opportunities in ${targetScope.label}!`
+          : `Identified ${this.scanResults.suggestions.length} high-yield visual opportunities!`,
+        5000
+      );
     } catch (err) {
       if (this.closed || generation !== this.scanGeneration) return;
+      this.pendingScanScope = null;
       this.scanErrorMessage = safeError(err);
       new Notice(`Scan failed: ${this.scanErrorMessage}`, 7000);
     } finally {
@@ -3073,6 +3663,7 @@ class MedicalImageFinderMobileView extends ItemView {
     const generation = this.scanGeneration;
     const context = this.scanContext;
     const suggestion = this.scanResults?.suggestions[index];
+    const targetScope = this.scanResults?.scope || null;
     this.inlineLoading.add(index);
     this.render();
 
@@ -3090,6 +3681,7 @@ class MedicalImageFinderMobileView extends ItemView {
           targetHeading: suggestion?.heading,
           targetConcept: suggestion?.visualConcept,
           targetQuery: suggestion?.recommendedQuery,
+          targetScope,
           searchOriginSuggestionIndex: index
         }))
       );
@@ -3130,6 +3722,7 @@ class MedicalImageFinderMobileView extends ItemView {
     const targetHeading = this.searchTargetHeading;
     const targetConcept = this.searchTargetConcept;
     const targetQuery = this.searchTargetQuery;
+    const targetScope = this.searchTargetScope;
     const originIdx = this.searchOriginSuggestionIndex;
     this.currentQuery = query;
     this.isSearching = true;
@@ -3151,6 +3744,7 @@ class MedicalImageFinderMobileView extends ItemView {
         targetHeading,
         targetConcept,
         targetQuery,
+        targetScope,
         searchOriginSuggestionIndex: originIdx
       }));
       this.isSearching = false;
@@ -3429,7 +4023,7 @@ class MedicalImageFinderMobileView extends ItemView {
     }
 
     const list = root.createDiv({ cls: "mifm-results-list" });
-    this.results.forEach((item) => {
+    this.results.forEach((item, rIdx) => {
       const card = list.createDiv({ cls: "mifm-card" });
       const thumbContainer = card.createDiv({ cls: "mifm-thumb-container" });
       const img = thumbContainer.createEl("img", {
@@ -3441,13 +4035,13 @@ class MedicalImageFinderMobileView extends ItemView {
           decoding: "async"
         }
       });
-      bindImageFallback(img, item.imageUrl);
-
-      if (item.width && item.height) {
-        thumbContainer.createDiv({ text: `${item.width}×${item.height}`, cls: "mifm-thumb-overlay" });
-      }
+      const overlay = thumbContainer.createDiv({ cls: "mifm-thumb-overlay" });
+      bindHighResPreview(img, overlay, item);
       thumbContainer.onclick = () => {
-        new ImagePreviewModal(this.app, this.plugin, item, this).open();
+        new ImagePreviewModal(this.app, this.plugin, item, this, {
+          items: this.results,
+          currentIndex: rIdx
+        }).open();
       };
 
       const body = card.createDiv({ cls: "mifm-card-body" });
@@ -3498,7 +4092,11 @@ class MedicalImageFinderMobileView extends ItemView {
 
       const subActions = body.createDiv({ cls: "mifm-sub-actions" });
       const previewLink = subActions.createEl("button", { text: "🔍 Preview", cls: "mifm-link-btn" });
-      previewLink.onclick = () => new ImagePreviewModal(this.app, this.plugin, item, this).open();
+      previewLink.onclick = () =>
+        new ImagePreviewModal(this.app, this.plugin, item, this, {
+          items: this.results,
+          currentIndex: rIdx
+        }).open();
 
       const sourceUrl = item.sourceUrl || item.imageUrl;
       if (sourceUrl) {
@@ -3537,14 +4135,108 @@ class MedicalImageFinderMobileView extends ItemView {
       }
     };
 
-    const activeFile = this.plugin.getTargetView()?.file;
+    const targetView = this.plugin.getTargetView?.();
+    const activeFile = targetView?.file;
+    const activeEditor = targetView?.editor;
+    const noteContent = activeEditor?.getValue?.() || this.scanContext?.content || "";
+    const totalLines = activeEditor?.lineCount?.() || (noteContent ? noteContent.split(/\r?\n/).length : 1);
+    const liveSelection = this.detectEditorSelectionScope(targetView);
+    const liveSelKey = liveSelection ? `${liveSelection.startLine}-${liveSelection.endLine}` : "";
+    if (liveSelection) {
+      this.editorSelectionScope = liveSelection;
+      if (liveSelKey !== this._lastAutoSelectionKey) {
+        this._lastAutoSelectionKey = liveSelKey;
+        this.scopeMode = "selection";
+      }
+    } else if (!liveSelection && this._lastAutoSelectionKey) {
+      this._lastAutoSelectionKey = "";
+      if (this.scopeMode === "selection" && !this.editorSelectionScope) this.scopeMode = "full";
+    }
+
+    const sections = extractNoteSections(noteContent);
+    const scopeRow = hero.createDiv({ cls: "mifm-scan-scope-row" });
+    scopeRow.createSpan({ text: "🎯 Scan Scope:", cls: "mifm-scan-count-label" });
+    const scopeSelect = scopeRow.createEl("select", { cls: "mifm-scan-scope-select" });
+
+    const fullOpt = scopeSelect.createEl("option", { text: "Full Note (All Lines)", value: "full" });
+    if (this.scopeMode === "full") fullOpt.selected = true;
+
+    if (this.editorSelectionScope) {
+      const selOpt = scopeSelect.createEl("option", {
+        text: `Selection (Lines ${this.editorSelectionScope.startLine}–${this.editorSelectionScope.endLine})`,
+        value: "selection"
+      });
+      if (this.scopeMode === "selection") selOpt.selected = true;
+    }
+
+    if (sections.length > 0) {
+      for (const sec of sections) {
+        const prefix = "#".repeat(Math.min(sec.level, 3));
+        const secOpt = scopeSelect.createEl("option", {
+          text: `${prefix} ${sec.heading} (L${sec.startLine}–${sec.endLine})`,
+          value: `sec:${sec.key}`
+        });
+        if (this.scopeMode === "section" && this.selectedSectionKey === sec.key) secOpt.selected = true;
+      }
+    }
+
+    const customOpt = scopeSelect.createEl("option", { text: "Custom Line Range...", value: "custom" });
+    if (this.scopeMode === "custom") customOpt.selected = true;
+
+    scopeSelect.onchange = () => {
+      const val = scopeSelect.value;
+      if (val === "full") {
+        this.scopeMode = "full";
+      } else if (val === "selection") {
+        this.scopeMode = "selection";
+      } else if (val === "custom") {
+        this.scopeMode = "custom";
+        if (!this.customScopeEnd || this.customScopeEnd < this.customScopeStart) {
+          this.customScopeStart = 1;
+          this.customScopeEnd = Math.min(totalLines, 40);
+        }
+      } else if (val.startsWith("sec:")) {
+        this.scopeMode = "section";
+        this.selectedSectionKey = val.slice(4);
+      }
+      this.render();
+    };
+
+    if (this.scopeMode === "custom") {
+      const rangeBox = hero.createDiv({ cls: "mifm-scope-custom-inputs" });
+      rangeBox.createSpan({ text: "From L" });
+      const fromInput = rangeBox.createEl("input", {
+        type: "number",
+        cls: "mifm-scope-line-input",
+        attr: { min: "1", max: String(totalLines) }
+      });
+      fromInput.value = String(this.customScopeStart || 1);
+      fromInput.onchange = () => {
+        this.customScopeStart = Math.max(1, parseInt(fromInput.value, 10) || 1);
+        this.render();
+      };
+
+      rangeBox.createSpan({ text: "To L" });
+      const toInput = rangeBox.createEl("input", {
+        type: "number",
+        cls: "mifm-scope-line-input",
+        attr: { min: "1", max: String(totalLines) }
+      });
+      toInput.value = String(this.customScopeEnd || Math.min(totalLines, 40));
+      toInput.onchange = () => {
+        this.customScopeEnd = Math.max(this.customScopeStart || 1, parseInt(toInput.value, 10) || totalLines);
+        this.render();
+      };
+    }
+
+    const activeScope = this.getSelectedUiScope(targetView);
 
     // Primary Zero-API Mobile Bridge: Copy Note & Prompt
     const copyPromptBtn = hero.createEl("button", {
       cls: "mifm-scan-btn",
-      text: "📋 Copy Note & Prompt for AI App"
+      text: activeScope ? "📋 Copy Scoped Part & Prompt for AI App" : "📋 Copy Note & Prompt for AI App"
     });
-    copyPromptBtn.onclick = () => this.copyNotePromptForAiApp();
+    copyPromptBtn.onclick = () => this.copyNotePromptForAiApp(activeScope);
 
     const bridgeActionRow = hero.createDiv({ cls: "mifm-scan-actions" });
     bridgeActionRow.style.marginTop = "6px";
@@ -3645,6 +4337,23 @@ class MedicalImageFinderMobileView extends ItemView {
       text: `${this.scanResults.summary} (${this.scanResults.suggestions.length} visual opportunities)`
     });
 
+    const resultScope = this.scanResults.scope;
+    if (resultScope && resultScope.mode && resultScope.mode !== "full") {
+      const scopeBadgeRow = summaryBox.createDiv({ cls: "mifm-scope-badge-row" });
+      scopeBadgeRow.createSpan({
+        text: `📌 Scoped: ${resultScope.label}`,
+        cls: "mifm-scope-pill"
+      });
+      const resetScopeBtn = scopeBadgeRow.createEl("button", {
+        text: "Reset to Full Note",
+        cls: "mifm-link-btn"
+      });
+      resetScopeBtn.onclick = () => {
+        this.scopeMode = "full";
+        this.executeNoteScan(false, { mode: "full" });
+      };
+    }
+
     if (this.restoredFromMemory && this.plugin.settings.lastScannedNote) {
       const mismatch = activeFile && activeFile.basename !== this.plugin.settings.lastScannedNote;
       summaryBox.createDiv({
@@ -3676,7 +4385,52 @@ class MedicalImageFinderMobileView extends ItemView {
     autoPilotBtn.disabled = this.isAutoPiloting;
     autoPilotBtn.onclick = () => this.runAutoPilotBatch();
 
+    const categoryCounts = {};
+    let pendingCount = 0;
     this.scanResults.suggestions.forEach((s, idx) => {
+      const vType = s.visualType || "diagram";
+      categoryCounts[vType] = (categoryCounts[vType] || 0) + 1;
+      if (!this.insertedSuggestionIndices.has(idx)) pendingCount++;
+    });
+
+    const scanFilterBar = container.createDiv({ cls: "mifm-filter-bar mifm-scan-filter-bar" });
+    const makeScanFilterPill = (id, label) => {
+      const pill = scanFilterBar.createEl("button", {
+        text: label,
+        cls: `mifm-filter-pill ${this.scannerCategoryFilter === id ? "is-active" : ""}`
+      });
+      pill.onclick = () => {
+        this.scannerCategoryFilter = id;
+        this.render();
+      };
+    };
+    makeScanFilterPill("all", `All (${this.scanResults.suggestions.length})`);
+    makeScanFilterPill("pending", `Pending (${pendingCount})`);
+    for (const f of MEDICAL_VISUAL_FILTERS) {
+      if (f.id === "all") continue;
+      const cnt = categoryCounts[f.id] || 0;
+      if (cnt > 0 || this.scannerCategoryFilter === f.id) {
+        makeScanFilterPill(f.id, `${f.label} (${cnt})`);
+      }
+    }
+
+    const filteredSuggestions = this.scanResults.suggestions
+      .map((s, idx) => ({ s, idx }))
+      .filter(({ s, idx }) => {
+        if (this.scannerCategoryFilter === "pending") return !this.insertedSuggestionIndices.has(idx);
+        if (this.scannerCategoryFilter !== "all") return (s.visualType || "diagram") === this.scannerCategoryFilter;
+        return true;
+      });
+
+    if (filteredSuggestions.length === 0) {
+      container.createDiv({
+        cls: "mifm-status",
+        text: "No visual suggestions match this filter."
+      });
+      return;
+    }
+
+    filteredSuggestions.forEach(({ s, idx }) => {
       const card = container.createDiv({
         cls: `mifm-scan-card ${this.insertedSuggestionIndices.has(idx) ? "is-inserted" : ""}`
       });
@@ -3721,6 +4475,7 @@ class MedicalImageFinderMobileView extends ItemView {
         this.searchTargetHeading = s.heading;
         this.searchTargetConcept = s.visualConcept;
         this.searchTargetQuery = s.recommendedQuery;
+        this.searchTargetScope = this.scanResults?.scope || null;
         this.searchOriginSuggestionIndex = idx;
         this.lastActiveScannerIndex = idx;
         this.switchToSearchTab(s.recommendedQuery, s.visualType || "diagram", true);
@@ -3733,7 +4488,7 @@ class MedicalImageFinderMobileView extends ItemView {
         const inlineList = this.inlineQuickResults.get(idx);
         if (inlineList.length > 0) {
           const inlineContainer = card.createDiv({ cls: "mifm-inline-results" });
-          inlineList.forEach((item) => {
+          inlineList.forEach((item, tileIdx) => {
             const tile = inlineContainer.createDiv({ cls: "mifm-inline-thumb-card" });
             const inlineImg = tile.createEl("img", {
               cls: "mifm-inline-thumb-img",
@@ -3744,8 +4499,13 @@ class MedicalImageFinderMobileView extends ItemView {
                 decoding: "async"
               }
             });
-            bindImageFallback(inlineImg, item.imageUrl);
-            tile.onclick = () => new ImagePreviewModal(this.app, this.plugin, item, this).open();
+            const inlineOverlay = tile.createDiv({ cls: "mifm-thumb-overlay" });
+            bindHighResPreview(inlineImg, inlineOverlay, item);
+            tile.onclick = () =>
+              new ImagePreviewModal(this.app, this.plugin, item, this, {
+                items: inlineList,
+                currentIndex: tileIdx
+              }).open();
 
             const tileActions = tile.createDiv({ cls: "mifm-inline-thumb-actions" });
             const iBtn = tileActions.createEl("button", { text: "📥 Insert", cls: "mifm-link-btn" });
@@ -3896,6 +4656,21 @@ class MedicalImageFinderMobileSettingTab extends PluginSettingTab {
               this.plugin.settings.defaultImageWidth = num;
               await this.plugin.saveSettings();
             }
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Fast Batch Preview Size")
+      .setDesc("Thumbnail strip height in the Fast Batch Image Review modal (S / M / L / XL).")
+      .addDropdown((drop) => {
+        for (const preset of BATCH_SIZE_PRESETS) {
+          drop.addOption(preset.id, `${preset.label} — ${preset.title}`);
+        }
+        drop
+          .setValue(this.plugin.settings.batchPreviewSize || "lg")
+          .onChange(async (val) => {
+            this.plugin.settings.batchPreviewSize = BATCH_SIZE_PRESETS.some((p) => p.id === val) ? val : "lg";
+            await this.plugin.saveSettings({ clearCache: false });
           });
       });
 
@@ -4197,6 +4972,14 @@ class MedicalImageFinderMobilePlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "scan-selection-mobile",
+      name: "Scan selected part for visual opportunities (AI / Prompt)",
+      editorCallback: (editor, view) => {
+        this.triggerScopedPromptFromEditor(editor, view);
+      }
+    });
+
+    this.addCommand({
       id: "open-sidebar-mobile",
       name: "Open Medical Image Finder Mobile",
       callback: () => {
@@ -4216,6 +4999,14 @@ class MedicalImageFinderMobilePlugin extends Plugin {
               .setIcon("image")
               .onClick(() => {
                 this.triggerSearchFromEditor(editor, view);
+              });
+          });
+          menu.addItem((item) => {
+            item
+              .setTitle("📋 Scan selected part with AI")
+              .setIcon("sparkles")
+              .onClick(() => {
+                this.triggerScopedPromptFromEditor(editor, view);
               });
           });
         }
@@ -4352,9 +5143,77 @@ class MedicalImageFinderMobilePlugin extends Plugin {
   }
 
   async triggerScanFromCommand() {
+    const active = this.getTargetView();
+    const sel = active?.editor?.getSelection?.();
+    let selScope = null;
+    if (sel && sel.trim() && active?.editor) {
+      const from = active.editor.getCursor("from");
+      const to = active.editor.getCursor("to");
+      let startLine = (from?.line ?? 0) + 1;
+      let endLine = (to?.line ?? startLine - 1) + 1;
+      if (to && to.ch === 0 && endLine > startLine) endLine -= 1;
+      if (endLine < startLine) [startLine, endLine] = [endLine, startLine];
+      selScope = normalizeScanScope({ mode: "selection", startLine, endLine }, active.editor.lineCount());
+    }
     const leafView = await this.activateView();
     if (leafView && typeof leafView.switchToScanTab === "function") {
+      if (selScope) {
+        leafView.editorSelectionScope = selScope;
+        leafView.scopeMode = "selection";
+        leafView._lastAutoSelectionKey = `${selScope.startLine}-${selScope.endLine}`;
+      }
       leafView.switchToScanTab(true);
+    }
+  }
+
+  async triggerScopedPromptFromEditor(editor, view) {
+    this.lastMarkdownView = view;
+    const totalLines = editor?.lineCount?.() || 1;
+    let scope = null;
+    const sel = editor?.getSelection?.();
+    if (sel && sel.trim()) {
+      const from = editor.getCursor("from");
+      const to = editor.getCursor("to");
+      let startLine = (from?.line ?? 0) + 1;
+      let endLine = (to?.line ?? startLine - 1) + 1;
+      if (to && to.ch === 0 && endLine > startLine) endLine -= 1;
+      if (endLine < startLine) [startLine, endLine] = [endLine, startLine];
+      scope = normalizeScanScope({ mode: "selection", startLine, endLine }, totalLines);
+    } else if (editor) {
+      const cursorLine = (editor.getCursor()?.line ?? 0) + 1;
+      const content = editor.getValue?.() || "";
+      const sections = extractNoteSections(content);
+      const sec = sections.find((s) => cursorLine >= s.startLine && cursorLine <= s.endLine);
+      if (sec) {
+        scope = normalizeScanScope(
+          { mode: "section", startLine: sec.startLine, endLine: sec.endLine, heading: sec.heading },
+          totalLines
+        );
+      } else {
+        scope = normalizeScanScope({ mode: "custom", startLine: cursorLine, endLine: cursorLine }, totalLines);
+      }
+    }
+
+    const leafView = await this.activateView();
+    if (leafView && typeof leafView.switchToScanTab === "function") {
+      if (scope) {
+        if (scope.mode === "selection") {
+          leafView.editorSelectionScope = scope;
+          leafView._lastAutoSelectionKey = `${scope.startLine}-${scope.endLine}`;
+        } else if (scope.mode === "section") {
+          leafView.selectedSectionKey = `${scope.startLine}:${scope.heading || ""}`;
+        } else {
+          leafView.customScopeStart = scope.startLine;
+          leafView.customScopeEnd = scope.endLine;
+        }
+        leafView.scopeMode = scope.mode;
+      }
+      leafView.switchToScanTab(false);
+      if (this.settings.geminiApiKey && this.settings.aiBackend !== "offline") {
+        await leafView.executeNoteScan(false, scope);
+      } else {
+        await leafView.copyNotePromptForAiApp(scope);
+      }
     }
   }
 
@@ -4402,13 +5261,64 @@ class MedicalImageFinderMobilePlugin extends Plugin {
     return cleaned;
   }
 
-  findTopicInsertionPosition(editor, line = null, heading = null, concept = null, query = null) {
+  _findPointEndInRange(editor, targetPointIdx, rangeEndIdx) {
+    const pText = editor.getLine(targetPointIdx);
+    const bulletMatch = pText.match(/^(\s*)([-*+]|\d+[.)])\s+/);
+    if (bulletMatch) {
+      const parentIndent = bulletMatch[1].length;
+      let currEnd = targetPointIdx;
+      for (let scan = targetPointIdx + 1; scan < rangeEndIdx; scan++) {
+        const sLine = editor.getLine(scan);
+        const sTrim = sLine.trim();
+        if (!sTrim) {
+          let nextChild = false;
+          for (let la = scan + 1; la < rangeEndIdx; la++) {
+            const laLine = editor.getLine(la);
+            if (laLine.trim()) {
+              const laBm = laLine.match(/^(\s*)([-*+]|\d+[.)])\s+/);
+              if (laBm && laBm[1].length > parentIndent) nextChild = true;
+              break;
+            }
+          }
+          if (nextChild) continue;
+          break;
+        }
+        const sBm = sLine.match(/^(\s*)([-*+]|\d+[.)])\s+/);
+        if (sBm) {
+          if (sBm[1].length > parentIndent) {
+            currEnd = scan;
+            continue;
+          }
+          break;
+        } else {
+          currEnd = scan;
+        }
+      }
+      return { line: currEnd, ch: editor.getLine(currEnd).length };
+    }
+
+    let currEnd = targetPointIdx;
+    for (let scan = targetPointIdx + 1; scan < rangeEndIdx; scan++) {
+      const sTrim = editor.getLine(scan).trim();
+      if (!sTrim || /^[-*+]\s+/.test(sTrim) || sTrim.startsWith("#") || /^\d+[.)]\s+/.test(sTrim)) break;
+      currEnd = scan;
+    }
+    return { line: currEnd, ch: editor.getLine(currEnd).length };
+  }
+
+  findTopicInsertionPosition(editor, line = null, heading = null, concept = null, query = null, scope = null) {
     const lineCount = editor.lineCount();
     if (lineCount === 0) return { line: 0, ch: 0 };
 
+    const normScope = scope ? normalizeScanScope(scope, lineCount) : null;
+    const scopeStartIdx = normScope ? normScope.startLine - 1 : 0;
+    const scopeEndIdx = normScope ? normScope.endLine : lineCount;
+
     let startLineIdx;
     if (line != null && line > 0) {
-      startLineIdx = Math.max(0, Math.min(line - 1, lineCount - 1));
+      startLineIdx = Math.max(scopeStartIdx, Math.min(line - 1, scopeEndIdx - 1));
+    } else if (normScope) {
+      startLineIdx = scopeStartIdx;
     } else {
       startLineIdx = editor.getCursor("to").line;
     }
@@ -4430,7 +5340,7 @@ class MedicalImageFinderMobilePlugin extends Plugin {
           let substringMatch = null;
           for (const offset of offsets) {
             const cand = startLineIdx + offset;
-            if (cand >= 0 && cand < lineCount) {
+            if (cand >= scopeStartIdx && cand < scopeEndIdx) {
               const m = editor.getLine(cand).match(/^(#{1,6})\s+(.*)/);
               if (m) {
                 const candClean = cleanText(m[2]).replace(/^[0-9]+[.)]\s*/, "").trim().toLowerCase();
@@ -4454,7 +5364,7 @@ class MedicalImageFinderMobilePlugin extends Plugin {
       }
 
       if (headingIdx === null) {
-        for (let up = startLineIdx; up >= 0; up--) {
+        for (let up = startLineIdx; up >= scopeStartIdx; up--) {
           const m = editor.getLine(up).match(/^(#{1,6})\s+(.*)/);
           if (m) {
             headingIdx = up;
@@ -4466,10 +5376,10 @@ class MedicalImageFinderMobilePlugin extends Plugin {
     }
 
     if (headingIdx !== null) {
-      const sectionStartIdx = headingIdx + 1;
-      let sectionEndIdx = lineCount;
+      const sectionStartIdx = Math.max(scopeStartIdx, headingIdx + 1);
+      let sectionEndIdx = scopeEndIdx;
 
-      for (let curr = sectionStartIdx; curr < lineCount; curr++) {
+      for (let curr = sectionStartIdx; curr < scopeEndIdx; curr++) {
         const lineText = editor.getLine(curr);
         const trimmed = lineText.trim();
         const nextHeading = lineText.match(/^(#{1,6})\s+/);
@@ -4517,52 +5427,53 @@ class MedicalImageFinderMobilePlugin extends Plugin {
       else if (line != null && line - 1 >= sectionStartIdx && line - 1 < sectionEndIdx) targetPointIdx = line - 1;
 
       if (targetPointIdx !== null) {
-        const pText = editor.getLine(targetPointIdx);
-        const bulletMatch = pText.match(/^(\s*)([-*+]|\d+[.)])\s+/);
-        if (bulletMatch) {
-          const parentIndent = bulletMatch[1].length;
-          let currEnd = targetPointIdx;
-          for (let scan = targetPointIdx + 1; scan < sectionEndIdx; scan++) {
-            const sLine = editor.getLine(scan);
-            const sTrim = sLine.trim();
-            if (!sTrim) {
-              let nextChild = false;
-              for (let la = scan + 1; la < sectionEndIdx; la++) {
-                const laLine = editor.getLine(la);
-                if (laLine.trim()) {
-                  const laBm = laLine.match(/^(\s*)([-*+]|\d+[.)])\s+/);
-                  if (laBm && laBm[1].length > parentIndent) nextChild = true;
-                  break;
-                }
-              }
-              if (nextChild) continue;
-              break;
-            }
-            const sBm = sLine.match(/^(\s*)([-*+]|\d+[.)])\s+/);
-            if (sBm) {
-              if (sBm[1].length > parentIndent) {
-                currEnd = scan;
-                continue;
-              }
-              break;
-            } else {
-              currEnd = scan;
-            }
-          }
-          return { line: currEnd, ch: editor.getLine(currEnd).length };
-        }
-
-        let currEnd = targetPointIdx;
-        for (let scan = targetPointIdx + 1; scan < sectionEndIdx; scan++) {
-          const sTrim = editor.getLine(scan).trim();
-          if (!sTrim || /^[-*+]\s+/.test(sTrim) || sTrim.startsWith("#") || /^\d+[.)]\s+/.test(sTrim)) break;
-          currEnd = scan;
-        }
-        return { line: currEnd, ch: editor.getLine(currEnd).length };
+        return this._findPointEndInRange(editor, targetPointIdx, sectionEndIdx);
       }
 
       let lastContentIdx = headingIdx;
       for (let curr = sectionStartIdx; curr < sectionEndIdx; curr++) {
+        if (editor.getLine(curr).trim().length > 0) lastContentIdx = curr;
+      }
+      return { line: lastContentIdx, ch: editor.getLine(lastContentIdx).length };
+    }
+
+    if (normScope) {
+      const kw = MedicalImageFinderMobilePlugin.extractConceptKeywords(concept, query);
+      let bestMatchIdx = null;
+      let bestMatchScore = 0;
+      if (kw.length > 0) {
+        for (let cIdx = scopeStartIdx; cIdx < scopeEndIdx; cIdx++) {
+          const cLower = editor.getLine(cIdx).toLowerCase();
+          let score = 0;
+          for (const w of kw) {
+            const regex = new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+            if (regex.test(cLower)) score += 3;
+            else if (w.length >= 4 && cLower.includes(w)) score += 1;
+          }
+          if (score > 0 && line != null) {
+            const dist = Math.abs(cIdx - (line - 1));
+            if (dist === 0) score += 4;
+            else if (dist <= 2) score += 2;
+            else if (dist <= 5) score += 1;
+          }
+          if (
+            score > bestMatchScore ||
+            (score === bestMatchScore && bestMatchIdx !== null && line != null && Math.abs(cIdx - (line - 1)) < Math.abs(bestMatchIdx - (line - 1)))
+          ) {
+            bestMatchScore = score;
+            bestMatchIdx = cIdx;
+          }
+        }
+      }
+      if (bestMatchIdx !== null && bestMatchScore >= 2) {
+        return this._findPointEndInRange(editor, bestMatchIdx, scopeEndIdx);
+      }
+      if (line != null) {
+        const rawTarget = Math.max(scopeStartIdx, Math.min(line - 1, scopeEndIdx - 1));
+        return this._findPointEndInRange(editor, rawTarget, scopeEndIdx);
+      }
+      let lastContentIdx = scopeStartIdx;
+      for (let curr = scopeStartIdx; curr < scopeEndIdx; curr++) {
         if (editor.getLine(curr).trim().length > 0) lastContentIdx = curr;
       }
       return { line: lastContentIdx, ch: editor.getLine(lastContentIdx).length };
@@ -4577,14 +5488,14 @@ class MedicalImageFinderMobilePlugin extends Plugin {
     return { line: cursor.line, ch: cursor.ch };
   }
 
-  captureTarget(context = null, line = null, heading = null, concept = null, query = null) {
+  captureTarget(context = null, line = null, heading = null, concept = null, query = null, scope = null) {
     const view = context?.view || this.getTargetView();
     if (!view?.file || !view.editor || view.file.extension !== "md") {
       throw new Error("Open a Markdown note in the editor first.");
     }
     if (context) this.validateTarget(context);
     const editor = view.editor;
-    const position = this.findTopicInsertionPosition(editor, line, heading, concept, query);
+    const position = this.findTopicInsertionPosition(editor, line, heading, concept, query, scope);
     return {
       view,
       editor,
@@ -4814,7 +5725,8 @@ class MedicalImageFinderMobilePlugin extends Plugin {
       item.targetLine,
       item.targetHeading,
       item.targetConcept || item.visualConcept,
-      item.targetQuery || item.recommendedQuery
+      item.targetQuery || item.recommendedQuery,
+      item.targetScope || null
     );
     if (item.targetLine != null) target.position.ch = target.editor.getLine(target.position.line).length;
     const folderPath = attachmentPath(this.settings.attachmentFolder);
@@ -4854,7 +5766,14 @@ class MedicalImageFinderMobilePlugin extends Plugin {
 
       const plannedJobs = jobs.map((job) => ({
         ...job,
-        pos: this.findTopicInsertionPosition(editor, job.targetLine, job.targetHeading, job.targetConcept, job.targetQuery)
+        pos: this.findTopicInsertionPosition(
+          editor,
+          job.targetLine,
+          job.targetHeading,
+          job.targetConcept,
+          job.targetQuery,
+          job.targetScope || job.imageItem?.targetScope || null
+        )
       }));
 
       plannedJobs.sort(
@@ -4959,6 +5878,7 @@ class MedicalImageFinderMobilePlugin extends Plugin {
 
 MedicalImageFinderMobilePlugin._internals = {
   DEFAULT_SETTINGS,
+  BATCH_SIZE_PRESETS,
   SEARCH_PROVIDERS,
   MEDICAL_VISUAL_FILTERS,
   base64ToUint8Array,
@@ -4969,6 +5889,13 @@ MedicalImageFinderMobilePlugin._internals = {
   pureJsSha256Hex,
   sha256Hex,
   imageExtension,
+  bindImageFallback,
+  syncDimensionBadge,
+  bindHighResPreview,
+  extractNoteSections,
+  findEnclosingHeading,
+  normalizeScanScope,
+  prepareScopedLines,
   normalizeSettings,
   normalizeResults,
   attachmentPath,
@@ -4993,3 +5920,5 @@ MedicalImageFinderMobilePlugin._internals = {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = MedicalImageFinderMobilePlugin;
 }
+
+/* nosourcemap */

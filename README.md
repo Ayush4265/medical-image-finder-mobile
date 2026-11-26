@@ -14,15 +14,17 @@ A mobile-first Obsidian community plugin (`isDesktopOnly: false`) for medical st
 
 ## Key Features
 
-1. **Multi-Engine Medical Search**: Select text in any note and run **Find images** or use the sidebar engine switcher (`DuckDuckGo`, `Bright Data`, `Brave`, `Wikimedia`) with 7 medical mode pills (`All`, `Anatomy / Diagram`, `Radiology`, `HPE / Histology`, `Clinical / Surgical`, `Criteria / Scoring`, `Embryology / Physio`).
-2. **AI Note Visual Scanner**:
-   - **Copy Note & Prompt for AI App**: Generates a line-numbered `[L1]..[Ln]` prompt for Gemini, ChatGPT, or Claude on your iPad/Android, then imports the JSON or Markdown output via **Paste Response**.
+1. **Multi-Engine Medical Search & High-Res Previews**: Select text in any note and run **Find images** or use the sidebar engine switcher (`DuckDuckGo`, `Bright Data`, `Brave`, `Wikimedia`) with 7 medical mode pills (`All`, `Anatomy / Diagram`, `Radiology`, `HPE / Histology`, `Clinical / Surgical`, `Criteria / Scoring`, `Embryology / Physio`). Includes automatic full-resolution Bright Data Google Images (`udm=2`, `parsed_light` + retry), background high-res preview upgrades, live dimension & low-resolution (`⚠️ <250px`) badges, and an expandable **Big Preview Modal** (`← Prev` / `Next →`, `2× Zoom`, `+ Select for Batch`).
+2. **AI Note Visual Scanner & Partial-Note Scanning**:
+   - **Scan Scope**: Scan the **Full Note**, current **Selection**, any parsed `# Heading` section, or a **Custom Line Range**, plus **Scan selected part with AI** via command palette or editor menu.
+   - **Category Filter Pills**: Filter suggestions by `All`, `Pending`, or medical category without losing card positions.
+   - **Copy Note & Prompt for AI App**: Generates a line-numbered `[L1]..[Ln]` prompt for Gemini, ChatGPT, or Claude on your iPad/Android (full or scoped), then imports the JSON or Markdown output via **Paste Response** (with automatic out-of-scope filtering).
    - **Offline Scan**: Built-in medical rules engine requiring zero API keys.
    - **Optional Gemini API Scan**: Enter a free Google AI Studio key in Settings for 1-tap automated scanning inside Obsidian.
-3. **Fast Batch Image Review & 1-Click Auto-Pilot**: Switch search engines or retry individual cards with Bright Data / Brave / DuckDuckGo, toggle multiple images per topic, and insert **bottom-to-top** with smart list indentation and zero line drift.
+3. **Fast Batch Image Review & 1-Click Auto-Pilot**: Switch search engines or retry individual cards with Bright Data / Brave / DuckDuckGo, resize strips on the fly (`S / M / L / XL`, uncropped aspect-ratio fit), toggle multiple images per topic, and insert **bottom-to-top** with smart list indentation, scoped bounds, and zero line drift.
 4. **Offline Vault Attachments**: Saves images with SHA-256 content hashing in `Attachments/MedicalImages/` (configurable) to prevent duplicate files.
 
 ## Installation on iPad & Android
 
 - **Via LiveSync / Folder Sync**: Copy `.obsidian/plugins/medical-image-finder-mobile/` into your vault and enable **Medical Image Finder Mobile** in **Settings → Community plugins**.
-- **Via BRAT**: Push this folder to a GitHub repository with a release containing `main.js`, `manifest.json`, `styles.css`, and `versions.json`, then add the repository in BRAT on iPad/Android.
+- **Via BRAT**: Add `Ayush4265/medical-image-finder-mobile` in BRAT on iPad/Android (releases attach `main.js`, `manifest.json`, and `styles.css`).
